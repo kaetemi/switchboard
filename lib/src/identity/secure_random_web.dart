@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 /// Secure random bytes on the web. Internal; see `secure_random.dart`.
@@ -32,5 +33,16 @@ Uint8List secureRandomBytes(int length) {
   if (crypto == null) {
     throw UnsupportedError('no Web Crypto API for secure random bytes');
   }
-  return crypto.getRandomValues(Uint8List(length).toJS).toDart;
+  final bytes = Uint8List(length);
+  // Web Crypto limits each call to 65536 bytes, independently of the
+  // requested result's length. Never fall back to a non-secure source.
+  for (var offset = 0; offset < length; offset += 65536) {
+    final end = offset + 65536 < length ? offset + 65536 : length;
+    bytes.setRange(
+      offset,
+      end,
+      crypto.getRandomValues(Uint8List(end - offset).toJS).toDart,
+    );
+  }
+  return bytes;
 }
