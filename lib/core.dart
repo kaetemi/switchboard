@@ -10,7 +10,9 @@ Authors:
 
 /// Platform independent core of Switchboard: status codes, names, byte
 /// helpers, the in-memory and WebSocket transports, the stream binding's
-/// wire format, the mux and talk layers, credentials and connection
+/// wire format, the connection contract every binding implements
+/// (`MuxConnection`, `MuxChannel`, `BindingConnection`) and the frame mux
+/// that implements it, the talk layer, credentials and connection
 /// identity, addressing, the naming service and client, resolvers, the
 /// reference key-to-slot function, and the reconnecting client for
 /// frontends.
@@ -29,6 +31,8 @@ export 'src/identity/credential_issuer.dart' show CredentialIssuer;
 export 'src/identity/credential_verifier.dart';
 export 'src/identity/holder_key.dart';
 export 'src/identity/peer_identity.dart';
+export 'src/mux/binding_connection.dart';
+export 'src/mux/frame_mux_channel.dart' show FrameMuxChannel;
 export 'src/mux/mux_channel.dart' show MuxChannel, MuxChannelState, MuxPriority;
 export 'src/mux/mux_connection.dart';
 export 'src/mux/mux_frame.dart'
@@ -38,8 +42,8 @@ export 'src/mux/mux_frame.dart'
         MuxControlType,
         MuxCredit,
         MuxFrame,
-        MuxIdent,
         MuxLimits;
+export 'src/mux/mux_protocol.dart' show MuxIdent, verifyIdent;
 export 'src/name.dart';
 export 'src/naming/naming_client.dart';
 export 'src/naming/naming_protocol.dart';
