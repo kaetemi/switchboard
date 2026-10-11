@@ -9,7 +9,7 @@ Authors:
 
 import 'dart:convert';
 
-import '../mux/mux_frame.dart';
+import '../mux/mux_protocol.dart';
 import '../name.dart';
 import '../naming/naming_protocol.dart';
 

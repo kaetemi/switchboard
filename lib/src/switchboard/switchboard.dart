@@ -30,7 +30,7 @@ import '../identity/peer_identity.dart';
 import '../identity/secure_random.dart';
 import '../mux/mux_channel.dart';
 import '../mux/mux_connection.dart';
-import '../mux/mux_frame.dart';
+import '../mux/mux_protocol.dart';
 import '../name.dart';
 import '../naming/naming_protocol.dart';
 import '../naming/slot_table.dart';
@@ -1055,9 +1055,10 @@ class Switchboard {
   /// attempt. Failures are not cached.
   ///
   /// The first pooled connection with room for another channel is
-  /// returned. A connection has room unless its peer announced a channel
-  /// limit with LIMITS and [MuxConnection.openChannelCount] has reached
-  /// it. When no pooled connection has room, another one is established,
+  /// returned. A connection has room unless its peer states a channel
+  /// limit ([MuxConnection.peerMaxChannels]: with LIMITS on the frame mux)
+  /// and [MuxConnection.openChannelCount] has reached it. When no pooled
+  /// connection has room, another one is established,
   /// up to [maxConnectionsPerEndpoint]; beyond that the least loaded one
   /// is returned (opening on it then fails with
   /// [StatusCode.resourceExhausted]).
@@ -1216,9 +1217,9 @@ class Switchboard {
   }
 
   /// Whether [connection] can take another channel within the limit its
-  /// peer announced.
+  /// peer announced ([MuxConnection.peerMaxChannels]).
   static bool _hasRoom(MuxConnection connection) {
-    final max = connection.peerLimits?.maxChannels ?? 0;
+    final max = connection.peerMaxChannels;
     return max == 0 || connection.openChannelCount < max;
   }
 
