@@ -281,6 +281,27 @@ The protocol specification lives in the project wiki (section
   relay and slot gate forwarding still never connect to the node's own
   listeners. `Switchboard(localConnections: false)` dials them through a
   socket as before.
+- Binding seam: `MuxConnection` and `MuxChannel` are the connection and
+  channel contracts the layers above program against (node, Talk, proxy,
+  relay, slot channels, `PeerSet`, `ReconnectingClient`, `MeshNode`, the
+  naming client and service, identity), so that a binding other than the
+  frame mux, such as one giving every channel a QUIC stream, can carry
+  them. `MuxConnection(...)` still runs the frame mux, whose channel is now
+  `FrameMuxChannel`; `MuxChannel` is an abstract class. New:
+  `BindingConnection` (the base of another binding's connection, answering
+  the frame mux's diagnostics), `MuxChannel.sendCost` (what a subframe
+  takes of the window: its length plus 16 on the frame mux; slot channels
+  count what they hold with it), `MuxConnection.peerMaxChannels` (the pool
+  reads it instead of the peer's LIMITS), `verifyIdent` (the `IDENT` checks
+  every binding applies, which the frame mux runs through), the binding
+  registry of `Switchboard` (`SwitchboardBinding`, `BindingDialSettings`,
+  `Switchboard(bindings:)`, `registerBinding`, `bindingSchemes`) with
+  `Switchboard.adopt` for the connections a binding's listener accepts,
+  and `ReconnectingClient.connections` (`ConnectionConnector`). What every
+  binding carries identically (`MuxIdent`, the status rules of CLOSE and
+  GOAWAY) moved from `mux_frame.dart` to `mux_protocol.dart`, which it
+  re-exports. No wire change; the built-in `ws`, `wss`, `tcp` and `mem`
+  are dialled and pooled as before.
 - Naming and sharding fixes: the `RESUME` of a rolled-back migration is
   sent again until the old owner answers it (the `ASSIGN` backoff
   intervals); after `NamingService.resumeAttempts` (5) failures in a row
