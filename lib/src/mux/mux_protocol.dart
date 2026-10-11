@@ -10,8 +10,9 @@ Authors:
 
 /// What every binding of a connection carries identically, whatever its
 /// framing (the frame mux, a stream binding such as QUIC): the `IDENT`
-/// payload and its verification, the bound on control payloads, and the
-/// rules for the status of a channel CLOSE or a GOAWAY.
+/// payload and its verification (the proof bound to the nonces, or also to
+/// the TLS exporter a stream binding supplies), the bound on control
+/// payloads, and the rules for the status of a channel CLOSE or a GOAWAY.
 ///
 /// The frame mux's own wire format (frame header, LIMITS, CREDIT) is in
 /// `mux_frame.dart`, which re-exports this library.
@@ -173,6 +174,16 @@ class MuxIdent {
   /// The label the proof starts with: `SWBIDENT` in ASCII.
   static final Uint8List proofLabel = Uint8List.fromList('SWBIDENT'.codeUnits);
 
+  /// The label an exporter-bound proof starts with instead: `SWBIDTLS` in
+  /// ASCII. The two labels keep a signature of one form from verifying as
+  /// the other.
+  static final Uint8List exporterProofLabel = Uint8List.fromList(
+    'SWBIDTLS'.codeUnits,
+  );
+
+  /// Length of the TLS exporter an exporter-bound proof signs.
+  static const int exporterLength = 32;
+
   /// The encoded credential.
   final Uint8List credential;
 
@@ -193,21 +204,41 @@ class MuxIdent {
   /// the intent and the receiver as the IDENT carries them, each with its
   /// `len8` length, so that no byte can move from one field to the other.
   ///
+  /// With an [exporter] (a binding that binds the proof to its TLS session,
+  /// such as the QUIC and WebTransport binding when both sides can compute
+  /// the exporter), the message is the exporter-bound one instead:
+  /// [exporterProofLabel], the two nonces, the [exporterLength] bytes of
+  /// the exporter, then the intent and the receiver as above. The frame
+  /// mux never passes one.
+  ///
   /// Throws [ArgumentError] for an [intent] or [receiver] longer than a
-  /// `len8` field can carry.
+  /// `len8` field can carry, and for an [exporter] that is not
+  /// [exporterLength] bytes long.
   static Uint8List proofMessage(
     List<int> senderNonce,
     List<int> receiverNonce,
     List<int> intent,
-    List<int> receiver,
-  ) {
+    List<int> receiver, {
+    List<int>? exporter,
+  }) {
     if (intent.length > 0xFF || receiver.length > 0xFF) {
       throw ArgumentError('intent or receiver longer than 255 bytes');
     }
-    return (BytesBuilder(copy: false)
-          ..add(proofLabel)
-          ..add(senderNonce)
-          ..add(receiverNonce)
+    if (exporter != null && exporter.length != exporterLength) {
+      throw ArgumentError.value(
+        exporter.length,
+        'exporter',
+        'an exporter is $exporterLength bytes',
+      );
+    }
+    final builder = BytesBuilder(copy: false)
+      ..add(exporter == null ? proofLabel : exporterProofLabel)
+      ..add(senderNonce)
+      ..add(receiverNonce);
+    if (exporter != null) {
+      builder.add(exporter);
+    }
+    return (builder
           ..addByte(intent.length)
           ..add(intent)
           ..addByte(receiver.length)
@@ -313,6 +344,14 @@ class MuxIdent {
 /// carry no proof. The envelope rules (both nonces exchanged, lengths) are
 /// the caller's: [MuxIdent.decode] checks the lengths.
 ///
+/// With an [exporter] the proof must be the exporter-bound one
+/// ([MuxIdent.proofMessage] with that exporter): a binding that binds
+/// identification to its TLS session passes the session's exporter when
+/// both sides announced they can compute it, and a nonce-bound proof then
+/// fails, as an exporter-bound one fails without it. Throws
+/// [ArgumentError] for an [exporter] that is not
+/// [MuxIdent.exporterLength] bytes long. The frame mux never passes one.
+///
 /// The identity's [PeerIdentity.verifiedAt] is the time of
 /// `package:clock`. Throws [SwitchboardException] with
 /// [StatusCode.unauthenticated] and the reason when the `IDENT` is refused,
@@ -327,7 +366,15 @@ Future<PeerIdentity> verifyIdent(
   required Uint8List receiverNonce,
   String? localIdentity,
   bool requireNamedIdent = false,
+  Uint8List? exporter,
 }) async {
+  if (exporter != null && exporter.length != MuxIdent.exporterLength) {
+    throw ArgumentError.value(
+      exporter.length,
+      'exporter',
+      'an exporter is ${MuxIdent.exporterLength} bytes',
+    );
+  }
   final problem = identReceiverProblem(
     ident.receiver,
     localIdentity: localIdentity,
@@ -355,6 +402,7 @@ Future<PeerIdentity> verifyIdent(
           receiverNonce,
           ident.intent,
           ident.receiver,
+          exporter: exporter,
         ),
         ident.proof,
       )) {
