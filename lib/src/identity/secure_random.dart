@@ -7,8 +7,9 @@ Authors:
   Claude Opus 5.5 <noreply@anthropic.com>
 */
 
-/// Cryptographically secure random bytes on every platform. Internal to
-/// the package; not exported.
+/// Cryptographically secure random bytes on every platform
+/// (`secureRandomBytes`): exported from `core.dart` for bindings in other
+/// packages, which draw their `NONCE` from it as the frame mux does.
 library;
 
 export 'secure_random_native.dart'

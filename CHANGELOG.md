@@ -329,6 +329,9 @@ The protocol specification lives in the project wiki (section
   `MuxIdent.exporterLength`); a proof of one form never verifies as the
   other. The frame mux never passes one: no wire change, and nothing
   changes over the frame mux. Test vector X of the binding page.
+  `secureRandomBytes` is exported from `core.dart`, so that a binding in
+  another package draws its `NONCE` as the frame mux does (on the web
+  through `crypto.getRandomValues`, which works under Node.js too).
 - Naming and sharding fixes: the `RESUME` of a rolled-back migration is
   sent again until the old owner answers it (the `ASSIGN` backoff
   intervals); after `NamingService.resumeAttempts` (5) failures in a row
