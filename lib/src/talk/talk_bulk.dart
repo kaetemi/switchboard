@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 /// The wire structures of Talk bulk payloads (wiki page "Polyverse
@@ -21,6 +22,7 @@ import 'package:meta/meta.dart';
 import '../address/channel_address.dart';
 import '../bytes.dart';
 import '../mux/mux_channel.dart';
+import '../mux/mux_connection.dart';
 import '../name.dart';
 import '../status.dart';
 
@@ -205,6 +207,12 @@ abstract final class BulkRoutes {
     'bulk routes',
   );
   static final Expando<bool> _bulk = Expando<bool>('bulk channel');
+  static final Expando<_PendingParents> _pending = Expando<_PendingParents>(
+    'bulk opens before parents',
+  );
+  static final Expando<_EndedParents> _ended = Expando<_EndedParents>(
+    'bulk opens after parents',
+  );
 
   /// The target registered for a parent, kept after the parent closed for
   /// [follow].
@@ -239,6 +247,7 @@ abstract final class BulkRoutes {
     }
     final route = _routeOf(parent);
     route.target = target;
+    _pending[parent.connection]?.dispatch(parent);
     final held = route.held;
     route.held = [];
     for (final (bulk, number, timer) in held) {
@@ -256,17 +265,71 @@ abstract final class BulkRoutes {
     }
   }
 
+  /// [target], which took the bulk channels the peer opened for [parent],
+  /// takes those that name [parent] after it ended, until [until]
+  /// completes: on a connection whose channels are not ordered
+  /// ([MuxConnection.hasOrderedChannels] false), a bulk channel the peer
+  /// opened before its graceful close may arrive after it, and is admitted
+  /// if a message referencing it arrived before the close (wiki page
+  /// "Polyverse Switchboard QUIC and WebTransport Binding", section "Bulk
+  /// payloads"). At most [maxHeld] parents of a connection linger at once.
+  /// False, and nothing is kept, beyond that, on an ordered connection,
+  /// and for a parent lingering already.
+  static bool linger(MuxChannel parent, BulkTarget target, Future<void> until) {
+    final connection = parent.connection;
+    if (connection.hasOrderedChannels) {
+      return false;
+    }
+    return (_ended[connection] ??= _EndedParents(
+      connection,
+    )).add(parent.id, target, until);
+  }
+
   /// Routes [bulk], a channel the peer opened with the open payload
   /// [open], to the target of its parent: closed `FAILED_PRECONDITION` when
-  /// no such channel is open on its connection (or it is itself a bulk
-  /// channel), or when something that is not a target reads it; held for
-  /// a target to come while nothing reads it yet, at most [maxHeld], then
+  /// no such channel is open (or it is itself a bulk channel), or when
+  /// something that is not a target reads it; held for a target to come
+  /// while nothing reads it yet, at most [maxHeld], then
   /// `RESOURCE_EXHAUSTED`. Held channels are closed `CANCELLED` when the
   /// parent closes.
+  ///
+  /// On a connection whose channels are not ordered
+  /// ([MuxConnection.hasOrderedChannels] false), a bulk channel can arrive
+  /// before its parent or after it ended: one naming a parent that
+  /// [linger]s goes to its target; one naming an id of the peer's parity
+  /// that is not open is held until the parent arrives, at most
+  /// [heldTimeout], in a backlog of [maxHeld] per connection (beyond it
+  /// `RESOURCE_EXHAUSTED`, after it `FAILED_PRECONDITION`); one naming an
+  /// id of this side's parity that is not open is refused at once.
   static void route(MuxChannel bulk, TalkBulkOpen open) {
     markBulk(bulk);
     bulk.priority = MuxPriority.bulk;
-    final parent = bulk.connection.channelWithId(open.parentId);
+    final connection = bulk.connection;
+    final parent = connection.channelWithId(open.parentId);
+    if (!connection.hasOrderedChannels &&
+        (parent == null || parent.state == MuxChannelState.closed)) {
+      final ended = _ended[connection];
+      final lingering = ended?.targetOf(open.parentId);
+      if (lingering != null) {
+        lingering(bulk, open.number);
+        return;
+      }
+      if (parent == null && (ended?.failed(open.parentId) ?? false)) {
+        // Its payloads failed with it.
+        _refuse(
+          bulk,
+          Status.of(StatusCode.cancelled, 'the parent channel failed'),
+        );
+        return;
+      }
+      // This side's own channels it knows; the peer's may not have
+      // arrived yet. Ids are not reused on such a connection.
+      final ours = open.parentId % 2 == (connection.isInitiator ? 0 : 1);
+      if (parent == null && !ours) {
+        (_pending[connection] ??= _PendingParents(connection)).hold(bulk, open);
+        return;
+      }
+    }
     if (parent == null ||
         identical(parent, bulk) ||
         isBulk(parent) ||
@@ -336,9 +399,13 @@ abstract final class BulkRoutes {
     }
     final route = routes[parent.id] = _Route(parent);
     unawaited(
-      parent.done.then((_) {
+      parent.done.then((status) {
         if (identical(routes[parent.id], route)) {
           routes.remove(parent.id);
+        }
+        final connection = parent.connection;
+        if (!status.isOk && !connection.hasOrderedChannels) {
+          (_ended[connection] ??= _EndedParents(connection)).fail(parent.id);
         }
         final held = route.held;
         route
@@ -355,6 +422,109 @@ abstract final class BulkRoutes {
       }),
     );
     return route;
+  }
+}
+
+/// Independent streams can deliver a bulk open before its parent's open.
+/// This is one bounded backlog per connection, not one per unknown id.
+class _PendingParents {
+  _PendingParents(MuxConnection connection) {
+    unawaited(connection.done.then((_) => _clear()));
+  }
+
+  final Map<MuxChannel, (TalkBulkOpen, Timer)> _held = {};
+
+  void hold(MuxChannel bulk, TalkBulkOpen open) {
+    if (_held.length >= BulkRoutes.maxHeld) {
+      BulkRoutes._refuse(
+        bulk,
+        Status.of(
+          StatusCode.resourceExhausted,
+          'too many unknown bulk parents',
+        ),
+      );
+      return;
+    }
+    final timer = Timer(BulkRoutes.heldTimeout, () {
+      _held.remove(bulk);
+      BulkRoutes._refuse(
+        bulk,
+        Status.of(StatusCode.failedPrecondition, 'bulk parent did not arrive'),
+      );
+    });
+    _held[bulk] = (open, timer);
+  }
+
+  void dispatch(MuxChannel parent) {
+    for (final entry in _held.entries.toList()) {
+      final (open, timer) = entry.value;
+      if (open.parentId == parent.id) {
+        _held.remove(entry.key);
+        timer.cancel();
+        BulkRoutes.route(entry.key, open);
+      }
+    }
+  }
+
+  void _clear() {
+    for (final (_, timer) in _held.values) {
+      timer.cancel();
+    }
+    _held.clear();
+  }
+}
+
+/// What a connection whose channels are not ordered remembers of the
+/// parents that ended: the targets of those that still wait for bulk
+/// channels ([BulkRoutes.linger]), at most [BulkRoutes.maxHeld], each until
+/// its target is done waiting; and the ids of the last [BulkRoutes.maxHeld]
+/// that ended with a failure status, whose late bulk channels are closed
+/// `CANCELLED` (ids are not reused on such a connection). Older ones are
+/// forgotten, their late bulk channels taken for ones whose parent has not
+/// arrived.
+class _EndedParents {
+  _EndedParents(MuxConnection connection) {
+    unawaited(
+      connection.done.then((_) {
+        _ended = true;
+        _targets.clear();
+        _failed.clear();
+      }),
+    );
+  }
+
+  final Map<int, BulkTarget> _targets = {};
+  // Insertion ordered: the oldest goes first.
+  final Set<int> _failed = <int>{};
+  bool _ended = false;
+
+  BulkTarget? targetOf(int parentId) => _targets[parentId];
+
+  bool failed(int parentId) => _failed.contains(parentId);
+
+  void fail(int parentId) {
+    if (_ended) {
+      return;
+    }
+    if (_failed.length >= BulkRoutes.maxHeld) {
+      _failed.remove(_failed.first);
+    }
+    _failed.add(parentId);
+  }
+
+  bool add(int parentId, BulkTarget target, Future<void> until) {
+    if (_ended ||
+        _targets.length >= BulkRoutes.maxHeld ||
+        _targets.containsKey(parentId)) {
+      return false;
+    }
+    _targets[parentId] = target;
+    until.whenComplete(() {
+      if (identical(_targets[parentId], target)) {
+        _targets.remove(parentId);
+      }
+    }).ignore();
+    return true;
   }
 }
 

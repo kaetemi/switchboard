@@ -281,6 +281,45 @@ The protocol specification lives in the project wiki (section
   relay and slot gate forwarding still never connect to the node's own
   listeners. `Switchboard(localConnections: false)` dials them through a
   socket as before.
+- Binding seam: `MuxConnection` and `MuxChannel` are the connection and
+  channel contracts the layers above program against (node, Talk, proxy,
+  relay, slot channels, `PeerSet`, `ReconnectingClient`, `MeshNode`, the
+  naming client and service, identity), so that a binding other than the
+  frame mux, such as one giving every channel a QUIC stream, can carry
+  them. `MuxConnection(...)` still runs the frame mux, whose channel is now
+  `FrameMuxChannel`; `MuxChannel` is an abstract class. New:
+  `BindingConnection` (the base of another binding's connection, answering
+  the frame mux's diagnostics), `MuxChannel.sendCost` (what a subframe
+  takes of the window: its length plus 16 on the frame mux; slot channels
+  count what they hold with it), `MuxConnection.peerMaxChannels` (the pool
+  reads it instead of the peer's LIMITS), `MuxConnection.hasOrderedChannels`
+  (false where channels are independent streams), `verifyIdent` and
+  `identReceiverProblem` (the `IDENT` checks every binding applies, which
+  the frame mux runs through), the status rules of CLOSE and GOAWAY for a
+  binding's wire (`checkMuxStatus`, `statusForWire`, `statusFromWire`,
+  `truncateStatus`, `decodeStatusPayload`, `maxControlPayloadLength`), the
+  binding registry of `Switchboard` (`SwitchboardBinding`,
+  `BindingDialSettings`, `Switchboard(bindings:)`, `registerBinding`,
+  `bindingSchemes`) with `Switchboard.adopt` for the connections a
+  binding's listener accepts and `Switchboard.addListeningEndpoint` /
+  `removeListeningEndpoint` for its endpoint (listed, the node's own, and
+  reached in-process under the declared policy), and
+  `ReconnectingClient.connections` (`ConnectionConnector`). `channelWithId`,
+  `identityChanged`, `hasListener`, `awaitingLimits` and `limitsKnown` are
+  public members of the contracts. What every binding carries identically
+  (`MuxIdent`, the status rules) moved from `mux_frame.dart` to
+  `mux_protocol.dart`, which it re-exports. Where channels are independent
+  streams, Talk and the channel proxy apply the bulk rules of the binding
+  specification (page "Polyverse Switchboard QUIC and WebTransport
+  Binding", section "Bulk payloads"): a `_bulk` channel ahead of its parent
+  is held (16 per connection, 10 s), one naming a parent of the receiver's
+  own parity that is not open refused at once, bulk numbers matched with
+  their references, a graceful close waiting for the bulk channels
+  referenced before it (16 such parents per connection), a late one for a
+  failed parent closed `CANCELLED`; the proxy forwards them toward a frame
+  mux in increasing number and holds a graceful close for them. No wire
+  change, and nothing changes over the frame mux; the built-in `ws`,
+  `wss`, `tcp` and `mem` are dialled and pooled as before.
 - Naming and sharding fixes: the `RESUME` of a rolled-back migration is
   sent again until the old owner answers it (the `ASSIGN` backoff
   intervals); after `NamingService.resumeAttempts` (5) failures in a row

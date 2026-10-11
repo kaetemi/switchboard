@@ -7,6 +7,7 @@ Authors:
   Claude Fable 5.1 <noreply@anthropic.com>
   Claude Opus 5.5 <noreply@anthropic.com>
   GPT-6 Astra <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 import 'dart:async';
@@ -14,7 +15,6 @@ import 'dart:collection';
 import 'dart:convert';
 import 'dart:typed_data';
 
-import 'package:clock/clock.dart';
 import 'package:logging/logging.dart';
 import 'package:meta/meta.dart';
 import 'package:stream_channel/stream_channel.dart';
@@ -23,19 +23,31 @@ import '../address/channel_address.dart';
 import '../bytes.dart';
 import '../identity/credential.dart';
 import '../identity/credential_verifier.dart';
-import '../identity/ed25519.dart';
 import '../identity/holder_key.dart';
 import '../identity/peer_identity.dart';
 import '../identity/secure_random.dart';
 import '../name.dart';
 import '../status.dart';
 import '../transport/transport_capabilities.dart';
+import 'binding_connection.dart';
+import 'frame_mux_channel.dart';
 import 'mux_channel.dart';
 import 'mux_frame.dart';
 
 final Logger _log = Logger('Switchboard.Mux');
 
 /// Local configuration of a [MuxConnection].
+///
+/// The frame mux honours every option. A binding that carries each channel
+/// on a stream of its own transport honours those of the connection
+/// contract: [keepAliveInterval], [keepAliveTimeout], [goAwayGrace],
+/// [maxChannels], [closeConfirmTimeout], [maxOpenPayloadBytes],
+/// [identityVerifier], [identityTimeout], [requireNamedIdent],
+/// [initialWindow] (its per-channel receive window), [bulkChunkSize], and
+/// [receiveHighWaterMarkBytes] where it can stop reading; the frame mux's
+/// own ([maxFrameSize], [shortIdsOnly], [announceLimits],
+/// [maxPendingRejections], [bulkZipper], [awaitPeerLimits]) do not apply
+/// to it.
 class MuxOptions {
   /// Creates options. Every value has a general purpose default.
   const MuxOptions({
@@ -290,13 +302,57 @@ class MuxOptions {
   );
 }
 
-/// The mux layer over one transport connection: any number of channels
-/// opened by either side, plus the control channel.
+/// A connection between two Switchboard sides: any number of channels
+/// ([MuxChannel]) opened by either side, plus what concerns the connection
+/// as a whole: round trips and keep-alive ([ping]), graceful shutdown
+/// ([goAway]) and the peer's identity ([identify], [peerIdentity]).
 ///
-/// See the wiki page "Polyverse Switchboard Mux".
+/// ## The binding contract
+///
+/// This class's interface is the contract of a connection, whatever
+/// carries it, and the layers above (the `Switchboard` node, Talk, the
+/// proxy, the relay, the naming service and client, `PeerSet`,
+/// `ReconnectingClient`) program against it alone. Constructing it runs
+/// the frame mux over a transport carrying one frame per event (wiki page
+/// "Polyverse Switchboard Mux"): this is how WebSocket, TCP and in-process
+/// connections are carried. Another binding, such as one giving every
+/// channel a QUIC stream of its own, implements the interface
+/// (`implements MuxConnection`), most simply by extending
+/// [BindingConnection], and its channels extend [MuxChannel]; a
+/// `Switchboard` dials its endpoints through a `SwitchboardBinding` and
+/// adopts the connections it accepts with `Switchboard.adopt`. Every
+/// binding honours:
+///
+/// * Channels: [open] and [incoming], each channel carrying its open
+///   payload unchanged and keeping the contract of [MuxChannel]; channel
+///   ids the same at both ends ([MuxChannel.id], [channelWithId]); a
+///   channel limit of this side ([MuxOptions.maxChannels]) and of the
+///   peer ([peerMaxChannels]).
+/// * The connection's control, ordered among itself: [ping], [goAway]
+///   (no new channels either way, except the `_bulk` channels
+///   [MuxChannel.openAfter] opens for open channels; the open ones finish
+///   within [MuxOptions.goAwayGrace]), [close], [done] and its end
+///   statuses, [peerGoingAway] and [peerGoAwayStatus], keep-alive
+///   ([MuxOptions.keepAliveInterval]).
+/// * Identity: the `NONCE`/`IDENT` exchange of [identify], with the same
+///   `IDENT` payload ([MuxIdent]) and the same checks (`verifyIdent`) in
+///   every binding; [peerIdentity], [peerIdentified], [identityRequested],
+///   [identityChanged] and [localIdentity]. A binding whose channels are
+///   not ordered with its control messages may deliver a channel opened
+///   right after an `IDENT` before the `IDENT` is verified; the node holds
+///   such channels until the peer identifies (`Switchboard.identityTimeout`).
+/// * [options], where they apply to the binding (see [MuxOptions]).
+///
+/// The frame mux's own diagnostics ([sentBytes], [receivedBytes],
+/// [peerLimits], [openPayloadBytes], [isReceivePaused],
+/// [unconfirmedCloseCount], [heldOutputBytes] and
+/// [nextChannelIdForTesting]) are part of the interface as well;
+/// [BindingConnection] answers them for a binding without such things.
+///
+/// See `doc/dart-design.md`, section "Binding seam".
 class MuxConnection {
-  /// Starts the mux over [transport], a [StreamChannel] carrying one mux
-  /// frame per event. [isInitiator] is true on the side that established
+  /// The frame mux: starts the mux over [transport], a [StreamChannel]
+  /// carrying one mux frame per event. [isInitiator] is true on the side that established
   /// the connection; it allocates even channel ids, the acceptor odd ones.
   ///
   /// Sends LIMITS at once if [MuxOptions.announceLimits] is set. If the
@@ -414,7 +470,8 @@ class MuxConnection {
   /// Whether this side initiated the connection.
   final bool isInitiator;
 
-  /// Local configuration.
+  /// Local configuration. A binding other than the frame mux honours the
+  /// options that apply to it (see [MuxOptions]).
   final MuxOptions options;
 
   final StreamChannel<Uint8List> _transport;
@@ -529,14 +586,42 @@ class MuxConnection {
   /// included. The transport's own framing (the stream binding's length
   /// prefix, WebSocket headers, TLS) is not counted, and frames handed
   /// over are not necessarily sent yet (see `OutputBufferedTransport`).
+  ///
+  /// A frame mux diagnostic: [BindingConnection] answers 0 for a binding
+  /// that does not count.
   int get sentBytes => _sentBytes;
 
   /// Bytes of the mux frames received from the transport so far, headers
-  /// included, counted as [sentBytes] is.
+  /// included, counted as [sentBytes] is. A frame mux diagnostic, as
+  /// [sentBytes] is.
   int get receivedBytes => _receivedBytes;
 
   /// Limits the peer announced with LIMITS, or null if none arrived.
+  ///
+  /// A frame mux diagnostic: null for a binding without LIMITS. What the
+  /// layers above need of it is [peerMaxChannels] and
+  /// [MuxChannel.maxSubframeLength].
   MuxLimits? get peerLimits => _peerLimits;
+
+  /// The most channels the peer accepts open at once, as it stated it, or
+  /// 0 when it states no limit (or has not stated one yet). A
+  /// `Switchboard` opens another pooled connection to an endpoint once
+  /// [openChannelCount] reached it. The frame mux: the channel limit of
+  /// the peer's LIMITS ([peerLimits]). A stream binding translates its
+  /// stream capacity into this simultaneous channel limit, in both
+  /// directions; a cumulative transport stream-id limit is not this value.
+  int get peerMaxChannels => _peerLimits?.maxChannels ?? 0;
+
+  /// Whether the channels [MuxChannel.openAfter] opens reach the peer in
+  /// order with their parent's subframes and close, and in call order:
+  /// true for the frame mux, false for a binding whose channels are
+  /// independent streams ([BindingConnection]). Where it is false, a
+  /// `_bulk` channel may arrive before its parent, after its parent
+  /// ended, or out of number order, and Talk and the channel proxy apply
+  /// the rules of the binding specification instead of the frame mux's
+  /// (see [MuxChannel.openAfter]). It says nothing about the order of
+  /// unrelated channels, nor of channels and control messages.
+  bool get hasOrderedChannels => true;
 
   /// Number of channels not yet mutually closed, in both directions.
   /// Incoming channels rejected by the connection itself, and channels
@@ -544,8 +629,8 @@ class MuxConnection {
   int get openChannelCount => _openCount;
 
   /// The channel with [id] that is not mutually closed yet, if any: one
-  /// of [channels].
-  @internal
+  /// of [channels]. Talk finds the parent a `_bulk` open payload names
+  /// with it, which is why [MuxChannel.id] is the same at both ends.
   MuxChannel? channelWithId(int id) => _links[id]?.channel;
 
   /// The channels counted by [openChannelCount], as a snapshot.
@@ -553,26 +638,29 @@ class MuxConnection {
     for (final link in _links.values) link.channel,
   ];
 
-  /// Bytes received and not delivered to a stream's listener yet over all
-  /// channels, at their flow-control cost (a subframe's length plus 16),
-  /// plus the OPEN payloads held for the channels the peer opened until
-  /// they are closed and delivered (see [MuxOptions.maxOpenPayloadBytes]).
-  /// Compared against [MuxOptions.receiveHighWaterMarkBytes]. What a
+  /// Receive backlog at flow-control cost. The frame mux counts all
+  /// channels (including closed, undelivered ones) and held OPEN payloads
+  /// against [MuxOptions.receiveHighWaterMarkBytes]. [BindingConnection]
+  /// defaults to the sum of its current channels' buffered bytes; a
+  /// binding can include its additional receive bookkeeping. What a
   /// listener with [MuxChannel.manualCredit] holds is not counted (see
   /// there); each channel's window bounds it.
   int get bufferedBytes => _bufferedBytes;
 
   /// Bytes of OPEN payloads held for the channels the peer opened that are
   /// still open or awaiting delivery; bounded by [MuxOptions.maxOpenPayloadBytes].
+  /// A frame mux diagnostic: [BindingConnection] answers 0.
   int get openPayloadBytes => _openPayloadBytes;
 
   /// Whether reading the transport is paused because more than
-  /// [MuxOptions.receiveHighWaterMarkBytes] are buffered.
+  /// [MuxOptions.receiveHighWaterMarkBytes] are buffered. A frame mux
+  /// diagnostic: [BindingConnection] answers false.
   bool get isReceivePaused => _receivePaused && !_closing;
 
   /// Number of channel ids we sent CLOSE for without keeping a channel and
   /// for which the peer's CLOSE has not arrived yet; bounded by
-  /// [MuxOptions.maxPendingRejections].
+  /// [MuxOptions.maxPendingRejections]. A frame mux diagnostic:
+  /// [BindingConnection] answers 0.
   int get unconfirmedCloseCount => _awaitingClose.length;
 
   /// Who the peer proved to be with its last valid `IDENT`, or null if it
@@ -581,9 +669,10 @@ class MuxConnection {
   /// the time of `package:clock`, until a valid `IDENT` with a renewed one
   /// arrives.
   ///
-  /// Frames the peer sends after an `IDENT` are handled only once that
-  /// `IDENT` is verified, so a channel opened right after it already sees
-  /// the identity it establishes.
+  /// On the frame mux, frames after an `IDENT` wait for verification,
+  /// so a channel opened right after it sees that identity. Independent
+  /// channel streams may arrive before control; dispatch then uses the
+  /// identity hold described in the binding contract above.
   PeerIdentity? get peerIdentity {
     final identity = _peerIdentity;
     return identity == null || identity.isExpired() ? null : identity;
@@ -602,17 +691,7 @@ class MuxConnection {
   /// side without a credential, which refuses every `IDENT` that names a
   /// receiver. A `Switchboard` sets it on every connection from its
   /// credential. See also [MuxOptions.requireNamedIdent].
-  String? get localIdentity => _localIdentity;
-
-  set localIdentity(String? identity) {
-    _localIdentity = identity;
-    _localIdentityBytes = identity == null
-        ? null
-        : Uint8List.fromList(utf8.encode(identity));
-  }
-
-  String? _localIdentity;
-  Uint8List? _localIdentityBytes;
+  String? localIdentity;
 
   /// Completes when the peer's `NONCE` arrives before this side sent one:
   /// the peer intends to identify, or asks this side to (the two cannot be
@@ -623,7 +702,9 @@ class MuxConnection {
 
   /// Completes at the next valid `IDENT` of the peer, or when the
   /// connection ends. For holding channels until the peer identifies.
-  @internal
+  /// Never fails. The new identity is visible through [peerIdentity]
+  /// before completion. Each read subscribes to the next change, rather
+  /// than replaying a previous one; callers stop waiting when [done] ends.
   Future<void> get identityChanged =>
       (_identityEvent ??= Completer<void>()).future;
 
@@ -641,7 +722,7 @@ class MuxConnection {
   /// that it cannot pass this side's identification on to a third node.
   ///
   /// Completes once the peer has handled the `IDENT`: a PING sent right
-  /// after it has been answered. A peer handles the frames after an
+  /// after it has been answered. A peer handles control messages after an
   /// `IDENT` only once it has verified it, so the answer means it accepted
   /// the credential (or does not check identity); a peer that refuses it
   /// ends the connection with GOAWAY `UNAUTHENTICATED`. Calling again sends
@@ -785,14 +866,15 @@ class MuxConnection {
     );
   }
 
-  /// Opens a channel carrying [openPayload] in its OPEN frame.
+  /// Opens a channel carrying [openPayload] in its OPEN frame (in every
+  /// binding: as the first thing the peer reads of the channel).
   ///
   /// The channel is usable at once. Throws [SwitchboardException] with
   /// [StatusCode.failedPrecondition] if the connection is closing, we sent
   /// GOAWAY, or the peer sent GOAWAY; with [StatusCode.resourceExhausted]
   /// if no channel id is free or the peer's announced channel limit is
   /// reached; with [StatusCode.frameTooLarge] if the OPEN frame would
-  /// exceed the peer's announced frame limit.
+  /// exceed the peer's announced frame limit (the frame mux).
   MuxChannel open(Uint8List openPayload) =>
       _openLink(openPayload, openWritten: true).channel;
 
@@ -948,11 +1030,12 @@ class MuxConnection {
   ///
   /// The reason is shortened on the wire if needed, on a UTF-8 character
   /// boundary, so that the GOAWAY payload stays within 1024 bytes and the
-  /// frame fits the peer's announced frame limit.
+  /// frame fits the peer's announced frame limit (on the frame mux).
   /// The local-only `CONNECTION_LOST` code is sent as `UNAVAILABLE`, while
   /// the local end status retains the given code.
   ///
-  /// Throws [ArgumentError] synchronously for application status codes.
+  /// Throws [ArgumentError] synchronously for application status codes;
+  /// the future never completes with an error.
   Future<void> goAway([Status status = const Status(33)]) {
     checkMuxStatus(status);
     if (_closing) {
@@ -997,7 +1080,8 @@ class MuxConnection {
 
   /// Sets the next id the allocator tries: in the short range for ids
   /// below 0x10000, else in the long range (used only once every short id
-  /// of our parity is in use). For tests of id wrapping.
+  /// of our parity is in use). For tests of id wrapping; the frame mux
+  /// only ([BindingConnection] throws [UnsupportedError]).
   @visibleForTesting
   set nextChannelIdForTesting(int id) {
     if (id <= MuxFrame.maxShortId) {
@@ -1113,6 +1197,7 @@ class MuxConnection {
   /// transport was not ready to take them (see [OutputReadyTransport]).
   /// DATA is held only once its channel's send window took it, so this is
   /// bounded by the windows the peer granted, plus a CLOSE per channel.
+  /// A frame mux diagnostic: [BindingConnection] answers 0.
   int get heldOutputBytes => _heldOutputBytes;
 
   bool get _outputReady {
@@ -1725,48 +1810,30 @@ class MuxConnection {
     Uint8List receiverNonce,
   ) async {
     PeerIdentity? identity;
-    var failure = _receiverProblem(ident.receiver) ?? '';
-    // Checked against this side's identity: valid UTF-8 when not empty.
-    final receiver = utf8.decode(ident.receiver, allowMalformed: true);
-    try {
-      if (failure.isNotEmpty) {
-        // Refused for its receiver: nothing else is checked.
-        throw SwitchboardException.of(StatusCode.unauthenticated, failure);
-      }
-      final credential = await verifier.verify(
-        Uint8List.fromList(ident.credential),
-      );
-      final holder = credential.holderKey;
-      if (holder == null) {
-        if (ident.proof.isNotEmpty) {
-          failure = 'a proof with a bearer credential';
-        }
-      } else if (ident.proof.length != MuxIdent.proofLength ||
-          !await ed25519Verify(
-            holder,
-            MuxIdent.proofMessage(
-              senderNonce,
-              receiverNonce,
-              ident.intent,
-              ident.receiver,
-            ),
-            ident.proof,
-          )) {
-        failure = 'proof of possession does not verify';
-      }
-      if (failure.isEmpty) {
-        identity = PeerIdentity(
-          credential: credential,
-          intent: Uint8List.fromList(ident.intent),
-          verifiedAt: clock.now(),
-          receiver: receiver,
+    // Refused for its receiver at once: nothing else is checked.
+    var failure =
+        identReceiverProblem(
+          ident.receiver,
+          localIdentity: localIdentity,
+          requireNamedIdent: options.requireNamedIdent,
+        ) ??
+        '';
+    if (failure.isEmpty) {
+      try {
+        identity = await verifyIdent(
+          ident,
+          verifier: verifier,
+          senderNonce: senderNonce,
+          receiverNonce: receiverNonce,
+          localIdentity: localIdentity,
+          requireNamedIdent: options.requireNamedIdent,
         );
+      } on SwitchboardException catch (e) {
+        failure = e.status.reason;
+      } on Object catch (e, st) {
+        _log.warning('$this: IDENT verification failed', e, st);
+        failure = 'verification failed';
       }
-    } on SwitchboardException catch (e) {
-      failure = e.status.reason;
-    } on Object catch (e, st) {
-      _log.warning('$this: IDENT verification failed', e, st);
-      failure = 'verification failed';
     }
     _verifyingIdent = false;
     if (_closing) {
@@ -1791,21 +1858,6 @@ class MuxConnection {
     if (!_closing) {
       _subscription.resume();
     }
-  }
-
-  /// Why an `IDENT` naming [receiver] is refused here, or null when it is
-  /// not: a receiver other than [localIdentity], or none while
-  /// [MuxOptions.requireNamedIdent].
-  String? _receiverProblem(Uint8List receiver) {
-    if (receiver.isEmpty) {
-      return options.requireNamedIdent ? 'the IDENT names no receiver' : null;
-    }
-    final own = _localIdentityBytes;
-    if (own == null || !_bytesEqual(own, receiver)) {
-      return 'the IDENT names another receiver '
-          '("${utf8.decode(receiver, allowMalformed: true)}")';
-    }
-    return null;
   }
 
   /// The status of the GOAWAY sent for an `IDENT` that fails verification.

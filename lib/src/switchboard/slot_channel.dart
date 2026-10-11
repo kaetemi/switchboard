@@ -17,7 +17,7 @@ import 'package:stream_channel/stream_channel.dart';
 
 import '../mux/mux_channel.dart';
 import '../mux/mux_connection.dart';
-import '../mux/mux_frame.dart';
+import '../mux/mux_protocol.dart';
 import '../name.dart';
 import '../status.dart';
 import '../status_closable.dart';
@@ -43,8 +43,9 @@ typedef SlotReopen = Future<MuxChannel?> Function(Status moved);
 /// refreshing the slot) with the same open payload, and takes over
 /// transparently. Subframes the caller sends while the replacement is
 /// being opened are sent on it, in order. At most [maxHeldBytes] are held
-/// meanwhile (each subframe counted at its flow-control cost, its length
-/// plus 16 bytes, as the mux counts it): a subframe beyond that is
+/// meanwhile (each subframe counted at its flow-control cost on the
+/// channel, [MuxChannel.sendCost]: its length plus 16 bytes on the frame
+/// mux): a subframe beyond that is
 /// dropped, the channel is closed with `RESOURCE_EXHAUSTED`, which [done]
 /// reports at once, and a replacement opened after all is closed with it
 /// too. Through `proxyHandler` the caller is a remote client, whose
@@ -104,7 +105,8 @@ class SlotChannel
   final int slot;
 
   /// Largest number of bytes held while the replacement is being opened,
-  /// each subframe counted at its flow-control cost (its length plus 16);
+  /// each subframe counted at its flow-control cost ([MuxChannel.sendCost]
+  /// of the current channel: its length plus 16 on the frame mux);
   /// beyond, the channel is closed with `RESOURCE_EXHAUSTED`. 0 (or less)
   /// means no limit.
   final int maxHeldBytes;
@@ -177,7 +179,7 @@ class SlotChannel
       );
     }
     if (_holding) {
-      final size = MuxCredit.costOf(subframe.length);
+      final size = _current.sendCost(subframe.length);
       if (maxHeldBytes > 0 && _pendingBytes + size > maxHeldBytes) {
         final status = _overflowed();
         return Future<void>.error(SwitchboardException(status))..ignore();

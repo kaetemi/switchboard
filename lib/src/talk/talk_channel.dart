@@ -6,6 +6,7 @@ Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
   GPT-6 Astra <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 import 'dart:async';
@@ -124,8 +125,9 @@ class TalkOptions {
   /// Sending: the largest message, in encoded bytes (header included),
   /// sent inline; a larger one goes as a bulk payload (see
   /// [TalkMessage.isBulk]). Null, the default, is the channel's own limit
-  /// ([MuxChannel.maxSubframeLength]: half the peer's initial window, less
-  /// the frame overhead), so that a payload goes bulk only when it must; a
+  /// ([MuxChannel.maxSubframeLength], the largest subframe the peer
+  /// accepts: on the frame mux half the peer's initial window, less the
+  /// frame overhead), so that a payload goes bulk only when it must; a
   /// lower value sends bulk earlier. Only over a mux channel; over any
   /// other `StreamChannel` every message goes inline.
   final int? bulkThreshold;
@@ -386,7 +388,12 @@ class TalkChannel {
   /// The parent must be open on the channel's connection: otherwise the
   /// bulk channel is closed `FAILED_PRECONDITION`, as it is when the parent
   /// is read by something other than a [TalkChannel] (or a pipe of
-  /// `pipeChannels`). A parent whose Talk layer is not created yet holds
+  /// `pipeChannels`). Where channels are independent streams
+  /// ([MuxConnection.hasOrderedChannels] false), a bulk channel may arrive
+  /// before its parent (held, at most 16 per connection for at most 10 s)
+  /// or after its parent ended (admitted if a message that arrived before
+  /// the close waits for it); see [MuxChannel.openAfter]. A parent whose
+  /// Talk layer is not created yet holds
   /// the bulk channel for it, at most [BulkRoutes.maxHeld], beyond which,
   /// as beyond [TalkOptions.maxUnclaimedBulk], it is closed
   /// `RESOURCE_EXHAUSTED`. A malformed open payload closes it
@@ -443,6 +450,24 @@ class TalkChannel {
   final Map<int, _Awaited> _bulkAwaited = {};
   final Set<_BulkIn> _bulkIns = {};
   int _bulkInHighest = 0;
+  // References travel on one ordered parent stream even when bulk opens
+  // travel on independent streams. This watermark retires numbers without
+  // keeping a lifetime-sized set of completed transfers.
+  int _bulkReferenceHighest = 0;
+
+  /// Whether the bulk channels the peer opens arrive in order with this
+  /// channel's frames ([MuxConnection.hasOrderedChannels]); see
+  /// [_adoptBulk] for the rules where they do not.
+  bool get _orderedBulk => _mux?.connection.hasOrderedChannels ?? true;
+
+  /// Set while the channel, closed gracefully by the peer, waits for the
+  /// bulk payloads of messages that arrived before the close ([_linger]);
+  /// completed when they all arrived or failed, or made no progress for
+  /// too long.
+  Completer<void>? _lingering;
+
+  /// While [_lingering]: when a bulk payload last progressed.
+  Duration _lingerProgress = Duration.zero;
 
   /// The reassembly budget in use ([TalkOptions.reassemblyBudget]): what
   /// the payloads admitted for a listener are charged, until taken.
@@ -1686,6 +1711,23 @@ class TalkChannel {
 
   /// Takes [bulk], a bulk channel the peer opened for this channel with
   /// bulk [number] ([BulkRoutes]).
+  ///
+  /// Where bulk channels are ordered with this channel's frames (the frame
+  /// mux), bulk numbers arrive in increasing order, each before the
+  /// message that references it: a number at or below one seen is a
+  /// channel protocol error. Where they are not
+  /// ([MuxConnection.hasOrderedChannels] false: a stream each), they may
+  /// arrive in any order, after their reference or after this channel
+  /// ended; only the references arrive in order, and they are what "seen"
+  /// means (wiki page "Polyverse Switchboard QUIC and WebTransport
+  /// Binding", section "Bulk payloads"): a number a reference waits for is
+  /// matched; a number above every reference waits for its own, as over
+  /// the frame mux; a second channel with a number already waiting is a
+  /// channel protocol error; any other number at or below the highest
+  /// referenced (its reference gave up waiting, or it was never
+  /// referenced) is closed `CANCELLED`; once the channel ended, only a
+  /// number a message still waits for ([_linger]) is admitted, any other
+  /// closed `FAILED_PRECONDITION`.
   void _adoptBulk(MuxChannel bulk, int number) {
     // Consumed as the reader takes its bytes; nothing listens to it yet.
     bulk
@@ -1694,26 +1736,34 @@ class TalkChannel {
     BulkRoutes.markBulk(bulk);
     final b = _BulkIn(this, bulk, number);
     if (_closing) {
-      b.close(Status.of(StatusCode.cancelled, 'channel closed'));
-      b.abandon();
-      return;
-    }
-    if (number <= _bulkInHighest) {
-      b.close(Status.of(StatusCode.protocolError, 'bulk number reused'));
-      b.abandon();
-      _protocolError('bulk number $number reused');
-      return;
-    }
-    _bulkInHighest = number;
-    final awaited = _bulkAwaited.remove(number);
-    if (awaited != null) {
-      awaited.timer.cancel();
-      final message = awaited.message;
-      if (message == null) {
-        b.abandon();
-      } else {
-        _attachBulk(message, b);
+      if (_lingering != null && _claimAwaited(number, b)) {
+        return;
       }
+      b.close(
+        _lingering != null
+            ? Status.of(StatusCode.failedPrecondition, 'the channel ended')
+            : Status.of(StatusCode.cancelled, 'channel closed'),
+      );
+      b.abandon();
+      return;
+    }
+    if (_orderedBulk) {
+      if (number <= _bulkInHighest) {
+        _refuseReused(b, number);
+        return;
+      }
+      _bulkInHighest = number;
+    } else if (_bulkUnclaimed.containsKey(number)) {
+      _refuseReused(b, number);
+      return;
+    } else if (number <= _bulkReferenceHighest &&
+        !_bulkAwaited.containsKey(number)) {
+      b
+        ..close(Status.of(StatusCode.cancelled, 'bulk number not referenced'))
+        ..abandon();
+      return;
+    }
+    if (_claimAwaited(number, b)) {
       return;
     }
     if (_bulkUnclaimed.length >= options.maxUnclaimedBulk) {
@@ -1744,6 +1794,32 @@ class TalkChannel {
     });
   }
 
+  /// A bulk channel with a number that cannot be used again: a channel
+  /// protocol error.
+  void _refuseReused(_BulkIn b, int number) {
+    b.close(Status.of(StatusCode.protocolError, 'bulk number reused'));
+    b.abandon();
+    _protocolError('bulk number $number reused');
+  }
+
+  /// Hands [b] to the message waiting for bulk [number], if a reference to
+  /// it arrived first: attached, or abandoned if the message was dropped.
+  bool _claimAwaited(int number, _BulkIn b) {
+    final awaited = _bulkAwaited.remove(number);
+    if (awaited == null) {
+      return false;
+    }
+    awaited.timer.cancel();
+    final message = awaited.message;
+    if (message == null) {
+      b.abandon();
+    } else {
+      _attachBulk(message, b);
+    }
+    _checkLinger();
+    return true;
+  }
+
   /// Claims the bulk channel [message] references, if it is a bulk
   /// message: attaches it, or waits for it to be adopted (its OPEN came
   /// first, but dispatch may lag). False, after a channel protocol error,
@@ -1765,6 +1841,9 @@ class TalkChannel {
       return true;
     }
     final number = reference.number;
+    if (!_acceptBulkReference(number)) {
+      return false;
+    }
     final b = _bulkUnclaimed.remove(number);
     if (b != null) {
       _queueForBudget(message);
@@ -1812,7 +1891,7 @@ class TalkChannel {
     try {
       do {
         _admitAgain = false;
-        while (_admission.isNotEmpty && !_closing) {
+        while (_admission.isNotEmpty && (!_closing || _lingering != null)) {
           final message = _admission.first;
           if (!message._inAdmission) {
             _admission.removeFirst();
@@ -1850,6 +1929,9 @@ class TalkChannel {
       return;
     }
     final number = frame.bulkReference.number;
+    if (!_acceptBulkReference(number)) {
+      return;
+    }
     final b = _bulkUnclaimed.remove(number);
     if (b != null) {
       b.abandon();
@@ -1863,6 +1945,31 @@ class TalkChannel {
       return;
     }
     _awaitBulk(number, null);
+  }
+
+  /// On independent streams only the references, all on the parent,
+  /// arrive in number order. An awaited open can still arrive below this
+  /// watermark; an already matched number cannot be used a second time,
+  /// and a bulk channel below it that arrived unreferenced never will be
+  /// referenced: it is closed `CANCELLED`.
+  bool _acceptBulkReference(int number) {
+    if (_orderedBulk) {
+      return true;
+    }
+    if (number <= _bulkReferenceHighest) {
+      _protocolError('bulk reference $number reused or out of order');
+      return false;
+    }
+    _bulkReferenceHighest = number;
+    for (final skipped in [
+      for (final n in _bulkUnclaimed.keys)
+        if (n < number) n,
+    ]) {
+      _bulkUnclaimed.remove(skipped)!
+        ..close(Status.of(StatusCode.cancelled, 'bulk number not referenced'))
+        ..abandon();
+    }
+    return true;
   }
 
   /// Dispatch may lag, but ignored responses must not buy unbounded
@@ -1881,6 +1988,11 @@ class TalkChannel {
 
   void _bulkNeverOpened(int number) {
     if (_bulkAwaited.remove(number) != null) {
+      if (_lingering != null) {
+        // The channel ended: the message is dropped with it.
+        _checkLinger();
+        return;
+      }
       _protocolError(
         'bulk channel $number not opened within ${options.bulkOpenTimeout}',
       );
@@ -2317,12 +2429,15 @@ class TalkChannel {
 
   Future<void> _peerEnded() async {
     var status = Status.of(StatusCode.connectionLost, 'channel closed');
+    var graceful = false;
     final r = raw;
     if (r is StatusClosable) {
       try {
         final end = await (r as StatusClosable).done;
         if (!end.isOk) {
           status = end;
+        } else {
+          graceful = true;
         }
       } catch (e, st) {
         _log.fine('raw channel done failed', e, st);
@@ -2331,12 +2446,121 @@ class TalkChannel {
       r.sink.close().ignore();
     }
     final error = SwitchboardException(status);
+    if (graceful && !_orderedBulk) {
+      await _linger(error);
+    }
     _terminate(error);
     // What waited for the peer's LIMITS goes nowhere: after the requests
     // it carries failed with the channel's status, its senders hear of it.
     _dropDeferred(error);
     await _finish();
   }
+
+  /// The peer closed the channel gracefully, and its bulk channels are not
+  /// ordered with it ([MuxConnection.hasOrderedChannels] false: a stream
+  /// each). The peer finished its payloads before its close, but they
+  /// travel on streams of their own and may still be arriving, or not have
+  /// arrived at all, where over the frame mux they would have arrived
+  /// whole before the close. (A Talk sender waits for its bulk channels to
+  /// be closed both ways before closing gracefully, so its payloads have
+  /// arrived; a peer need only have sent them.) Waits until they have:
+  /// until every bulk channel a message that arrived before the close
+  /// references has arrived and ended, or failed, as long as they
+  /// progress: at most
+  /// [TalkOptions.bulkIdleTimeout] (30 s when that is zero) without a
+  /// byte arriving or being read, as a payload waiting for the reassembly
+  /// budget or for its reader would not progress (on an open channel such
+  /// a wait is not cut). Meanwhile the bulk channels that name this
+  /// channel go on coming here ([BulkRoutes.linger], within its bound per
+  /// connection): admitted for a number a message waits for, closed
+  /// `FAILED_PRECONDITION` otherwise ([_adoptBulk]). What cannot be
+  /// answered any more ends at once, as it would over the frame mux:
+  /// requests without their final response fail with [error], incoming
+  /// requests become unanswerable, unreferenced bulk channels are closed.
+  /// Then the channel ends as over the frame mux ([_terminate]).
+  Future<void> _linger(SwitchboardException error) async {
+    final unclaimed = List.of(_bulkUnclaimed.values);
+    _bulkUnclaimed.clear();
+    for (final b in unclaimed) {
+      b.abandon();
+    }
+    for (final pending in List.of(_outgoing.values)) {
+      if (pending.finalReceived) {
+        continue;
+      }
+      _outgoing.remove(pending.id);
+      if (pending.abandoned) {
+        pending.stopTimer();
+      } else {
+        pending.fail(error);
+      }
+    }
+    final incoming = _incoming.values.toList();
+    _incoming.clear();
+    for (final message in incoming) {
+      message._abandon();
+    }
+    // What a dropped message referenced is not waited for.
+    _bulkAwaited.removeWhere((_, awaited) {
+      if (awaited.message != null) {
+        return false;
+      }
+      awaited.timer.cancel();
+      return true;
+    });
+    final mux = _mux;
+    if (mux == null || _bulkSettled) {
+      return;
+    }
+    final settled = Completer<void>();
+    if (!BulkRoutes.linger(mux, _adoptBulk, settled.future)) {
+      _log.fine('too many channels waiting for bulk payloads; not waiting');
+      settled.complete();
+      return;
+    }
+    _lingering = settled;
+    _lingerProgress = monotonicNow();
+    var limit = options.bulkIdleTimeout;
+    if (limit <= Duration.zero) {
+      limit = const Duration(seconds: 30);
+    }
+    Timer? timer;
+    void arm(Duration delay) {
+      timer = Timer(delay > _maxTimerDelay ? _maxTimerDelay : delay, () {
+        if (settled.isCompleted) {
+          return;
+        }
+        final idle = monotonicNow() - _lingerProgress;
+        if (idle < limit) {
+          arm(limit - idle);
+          return;
+        }
+        _log.fine('bulk payloads made no progress for $limit after the close');
+        settled.complete();
+      });
+    }
+
+    arm(limit);
+    await settled.future;
+    timer?.cancel();
+    _lingering = null;
+    // What arrived last reaches its readers before the channel ends.
+    await Future<void>.delayed(Duration.zero);
+  }
+
+  /// Ends [_linger] once nothing it waits for is left.
+  void _checkLinger() {
+    final settled = _lingering;
+    if (settled != null && !settled.isCompleted && _bulkSettled) {
+      settled.complete();
+    }
+  }
+
+  /// No bulk channel is awaited, and every one attached arrived whole or
+  /// failed.
+  bool get _bulkSettled =>
+      _bulkAwaited.isEmpty &&
+      _bulkIns.every((b) => b.channel.state == MuxChannelState.closed);
 
   // ---------------------------------------------------------------------
   // Shutdown

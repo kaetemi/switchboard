@@ -7,6 +7,7 @@ Authors:
   Claude Fable 5.1 <noreply@anthropic.com>
   Claude Opus 5.5 <noreply@anthropic.com>
   GPT-6 Astra <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 import 'dart:async';
@@ -23,6 +24,7 @@ import '../name.dart';
 import '../naming/naming_protocol.dart';
 import '../status.dart';
 import '../talk/talk_bulk.dart';
+import '../talk/talk_frame.dart';
 import 'forwarding.dart';
 import 'generic_status.dart';
 import 'incoming_channel.dart';
@@ -74,7 +76,14 @@ final Logger _log = Logger('Switchboard.Router');
 /// parent cancels its bulk twins in both directions; a graceful close
 /// waits for the transfers it follows, then cancels any twins left when
 /// the pipe ends. A drain that times out is forwarded as
-/// `DEADLINE_EXCEEDED`.
+/// `DEADLINE_EXCEEDED`. From a side whose bulk channels are independent
+/// streams ([MuxConnection.hasOrderedChannels] false), the bulk channels
+/// are forwarded in the order of their `BULK` references, which the proxy
+/// reads from the frames it forwards, so that a frame mux on the other
+/// side gets them in increasing number; and a graceful close also waits
+/// for the bulk channels referenced before it to arrive (wiki page
+/// "Polyverse Switchboard QUIC and WebTransport Binding", section
+/// "Proxying").
 ///
 /// Both streams are listened to before this returns, so subframes that
 /// arrived before the call (buffered by the channels) are forwarded too.
@@ -127,10 +136,10 @@ Future<void> _pipe(
   }
   try {
     // Before listening: a bulk channel may wait for its parent's target.
-    _routeBulk(a, b, towardB, bound: bulkBound);
-    _routeBulk(b, a, towardA);
-    _forward(a, b, twins: towardB, bulk: bulk);
-    _forward(b, a, rewrite: toA, twins: towardA, bulk: bulk);
+    final orderA = _routeBulk(a, b, towardB, bound: bulkBound);
+    final orderB = _routeBulk(b, a, towardA);
+    _forward(a, b, twins: towardB, bulk: bulk, bulkOrder: orderA);
+    _forward(b, a, rewrite: toA, twins: towardA, bulk: bulk, bulkOrder: orderB);
   } on Object catch (e) {
     _log.warning('proxy: cannot pipe channels ${a.id} and ${b.id}: $e');
     final status = Status.of(StatusCode.internal, 'cannot pipe channels');
@@ -225,7 +234,7 @@ class _SlotEnd implements _End {
 /// Forwards the bulk channels the peer of [from] opens for it toward [to]
 /// (see [pipeChannels]). A slot channel that replaces [from]'s mux channel
 /// keeps the route.
-void _routeBulk(
+_BulkOrder? _routeBulk(
   _End from,
   _End to,
   Set<_BulkTwin> twins, {
@@ -234,12 +243,192 @@ void _routeBulk(
   final mux = from.mux;
   if (BulkRoutes.isBulk(mux)) {
     // A bulk channel is never a parent.
-    return;
+    return null;
   }
-  BulkRoutes.register(
-    mux,
+  final order = _BulkOrder(
+    from,
     (bulk, number) => _forwardBulk(bulk, number, from, to, twins, bound),
+    bound,
   );
+  BulkRoutes.register(mux, order.open);
+  for (final end in [from, to]) {
+    unawaited(
+      end.done.then((status) {
+        if (!status.isOk) order.clear();
+      }),
+    );
+  }
+  unawaited(Future.wait([from.done, to.done]).then((_) => order.clear()));
+  return order;
+}
+
+/// The order in which the bulk channels the peer of [from] opens are
+/// forwarded. Where [from]'s connection orders them with the parent's
+/// frames ([MuxConnection.hasOrderedChannels], the frame mux), each is
+/// forwarded as it arrives, as the frames are. Where it does not (a stream
+/// each), they may arrive in any order, before or after the `BULK` message
+/// that references them, or after the parent ended; the references arrive
+/// in order on the parent, and the bulk channels are forwarded in their
+/// order, each once its reference passed or arrives, so that a frame mux
+/// on the other side gets them in increasing order, as it requires (a
+/// reference forwarded before its bulk channel is waited for there, as
+/// dispatch may lag). Subframes pass through unchanged and at once;
+/// references are read from them, and anything that is not a Talk frame
+/// is ignored. Bounded per parent: [BulkRoutes.maxHeld] bulk channels
+/// waiting for their references and as many references waiting for their
+/// bulk channels, each at most [BulkRoutes.heldTimeout]; waiting bulk
+/// channels count toward [bound].
+class _BulkOrder {
+  _BulkOrder(this.from, this.forward, this.bound);
+
+  final _End from;
+  final BulkTarget forward;
+  final ForwardingBound? bound;
+  final Map<int, (MuxChannel, Timer)> _opens = {};
+  final Map<int, Timer> _references = {};
+  int _highestReference = 0;
+  bool _ended = false;
+
+  /// [from] ended gracefully and [settle] waits.
+  bool _settling = false;
+
+  /// Completed once no reference waits for its bulk channel any more,
+  /// for a graceful close waiting for them ([settle]).
+  Completer<void>? _settled;
+
+  bool get _ordered => from.mux.connection.hasOrderedChannels;
+
+  void open(MuxChannel channel, int number) {
+    if (_ordered) {
+      forward(channel, number);
+      return;
+    }
+    if (_ended) {
+      unawaited(channel.close(genericStatus(StatusCode.cancelled)));
+      return;
+    }
+    if (_opens.containsKey(number) ||
+        (number <= _highestReference && !_references.containsKey(number))) {
+      // After the parent's end, only a referenced one is admitted.
+      unawaited(
+        channel.close(
+          genericStatus(
+            _settling ? StatusCode.failedPrecondition : StatusCode.cancelled,
+          ),
+        ),
+      );
+      return;
+    }
+    if (_opens.length >= BulkRoutes.maxHeld) {
+      unawaited(channel.close(genericStatus(StatusCode.resourceExhausted)));
+      return;
+    }
+    if (bound != null && !bound!.enter(channel.connection)) {
+      unawaited(channel.close(genericStatus(StatusCode.resourceExhausted)));
+      return;
+    }
+    final timer = Timer(BulkRoutes.heldTimeout, () {
+      _opens.remove(number);
+      bound?.exit(channel.connection);
+      unawaited(channel.close(genericStatus(StatusCode.cancelled)));
+    });
+    _opens[number] = (channel, timer);
+    _drain();
+  }
+
+  /// [bytes], a subframe from [from], is about to be forwarded.
+  void observe(Uint8List bytes) {
+    if (_ended || _ordered) return;
+    final TalkFrame frame;
+    try {
+      frame = TalkFrame.decode(bytes);
+    } on ProtocolException {
+      return; // Non-Talk subframes still pass through unchanged.
+    }
+    if (!frame.bulk) return;
+    final number = frame.bulkReference.number;
+    if (number <= _highestReference) return;
+    _highestReference = number;
+    if (_references.length < BulkRoutes.maxHeld) {
+      _references[number] = Timer(BulkRoutes.heldTimeout, () {
+        _references.remove(number);
+        _discardUnreferenced();
+        _drain();
+      });
+    }
+    _discardUnreferenced();
+    _drain();
+  }
+
+  /// [from] ended gracefully: the bulk channels its peer finished before
+  /// its close may still arrive, and go on being forwarded meanwhile
+  /// ([BulkRoutes.linger]). Returns what completes once no reference
+  /// waits for its bulk channel any more, or null when none does (the
+  /// frame mux: never) or [from]'s connection has too many such parents
+  /// already. Bulk channels no reference names will not be named any
+  /// more: they are closed `CANCELLED`.
+  Future<void>? settle() {
+    if (_ended || _ordered) return null;
+    _settling = true;
+    // Every reference arrived: nothing is above the last one.
+    _highestReference = 0xFFFFFFFF;
+    _discardUnreferenced();
+    if (_references.isEmpty) return null;
+    final settled = _settled ??= Completer<void>();
+    if (!BulkRoutes.linger(from.mux, open, settled.future)) {
+      clear();
+      return null;
+    }
+    return settled.future;
+  }
+
+  void _discardUnreferenced() {
+    for (final number in _opens.keys.toList()) {
+      if (number <= _highestReference && !_references.containsKey(number)) {
+        final (channel, timer) = _opens.remove(number)!;
+        timer.cancel();
+        bound?.exit(channel.connection);
+        unawaited(channel.close(genericStatus(StatusCode.cancelled)));
+      }
+    }
+    _checkSettled();
+  }
+
+  void _drain() {
+    while (_references.isNotEmpty) {
+      final number = _references.keys.first;
+      final open = _opens.remove(number);
+      if (open == null) break;
+      _references.remove(number)!.cancel();
+      final (channel, timer) = open;
+      timer.cancel();
+      bound?.exit(channel.connection);
+      forward(channel, number);
+    }
+    _checkSettled();
+  }
+
+  void _checkSettled() {
+    final settled = _settled;
+    if (settled != null && !settled.isCompleted && _references.isEmpty) {
+      settled.complete();
+    }
+  }
+
+  void clear() {
+    _ended = true;
+    for (final (channel, timer) in _opens.values) {
+      timer.cancel();
+      bound?.exit(channel.connection);
+      unawaited(channel.close(genericStatus(StatusCode.cancelled)));
+    }
+    _opens.clear();
+    for (final timer in _references.values) {
+      timer.cancel();
+    }
+    _references.clear();
+    _checkSettled();
+  }
 }
 
 /// Opens the twin of [bulk] (bulk number [number]) on [to]'s side, in
@@ -318,6 +507,7 @@ void _forward(
   Status Function(Status status)? rewrite,
   Set<_BulkTwin> twins = const {},
   bool bulk = false,
+  _BulkOrder? bulkOrder,
 }) {
   // Credit for what [from] receives goes back once [to] has taken it.
   from.manualCredit = true;
@@ -349,6 +539,7 @@ void _forward(
         return;
       }
       try {
+        bulkOrder?.observe(subframe);
         sending = to
             .send(subframe)
             .then(
@@ -374,13 +565,36 @@ void _forward(
             // it, as its failure and the end of its pipe do.
             await sending;
           }
+          // Independent streams: bulk channels referenced before the close
+          // may arrive after it, and are forwarded before it goes on.
+          final settling = forwarded.isOk ? bulkOrder?.settle() : null;
+          Duration? left;
+          if (settling != null) {
+            final wait = _twinWait(to);
+            final watch = Stopwatch()..start();
+            try {
+              await settling.timeout(wait);
+              left = wait - watch.elapsed;
+            } on TimeoutException {
+              _log.fine(
+                'proxy: channel ${to.id} closed with bulk channels still '
+                'awaited',
+              );
+              forwarded = genericStatus(StatusCode.deadlineExceeded);
+              bulkOrder!.clear();
+              _cancelTwins(twins);
+            }
+          }
           if (forwarded.isOk && twins.isNotEmpty) {
             // A graceful close follows the bulk payloads forwarded before
             // it, as it follows the subframes: the receiver must have them
             // whole before the channel they belong to ends.
             try {
-              await Future.wait<void>(twins.map((twin) => twin.done))
-                  .timeout(_twinWait(to));
+              await Future.wait<void>(twins.map((twin) => twin.done)).timeout(
+                left == null || left > Duration.zero
+                    ? left ?? _twinWait(to)
+                    : Duration.zero,
+              );
             } on TimeoutException {
               _log.fine(
                 'proxy: channel ${to.id} closed with bulk payloads still '

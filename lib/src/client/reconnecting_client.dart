@@ -6,6 +6,7 @@ Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
   GPT-6 Astra <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 import 'dart:async';
@@ -40,6 +41,20 @@ final Logger _log = Logger('Switchboard.Client');
 /// synchronously; an abandoned attempt installs no timeout, and any transport
 /// it returns later is discarded.
 typedef TransportConnector = Future<StreamChannel<Uint8List>> Function();
+
+/// Establishes a new connection to the endpoint through a binding of the
+/// connection contract other than the frame mux (a WebTransport binding in
+/// a browser, say), for [ReconnectingClient.connections]: the connection,
+/// established as its initiator with [options] (the client's
+/// [ReconnectingClient.muxOptions]). Called once per connection attempt.
+/// Its [MuxConnection.incoming] must have no listener: the client owns
+/// dispatch and the connection's lifetime after it is returned.
+///
+/// Failures count as those of a [TransportConnector] do; a connection it
+/// returns after the attempt was given up is closed.
+typedef ConnectionConnector = Future<MuxConnection> Function(
+  MuxOptions options,
+);
 
 /// Phase of a [ReconnectingClient]'s connection.
 enum ClientPhase {
@@ -164,7 +179,9 @@ class ClientState {
 /// ```
 ///
 /// Connecting: the connector is called (bounded by [connectTimeout]) and a
-/// [MuxConnection] is built over the transport as the initiator. Once
+/// [MuxConnection] is built over the transport as the initiator (the frame
+/// mux), or, for a client made with [ReconnectingClient.connections], the
+/// connector establishes the connection through its own binding. Once
 /// connected, every persistent channel is opened (all at once, in the
 /// order they were created) and pending [openChannel] calls proceed.
 ///
@@ -218,15 +235,78 @@ class ReconnectingClient {
     TransportConnector connect, {
     MuxOptions? muxOptions,
     TalkOptions? talkOptions,
-    this.initialBackoff = const Duration(milliseconds: 500),
-    this.maxBackoff = const Duration(seconds: 30),
-    this.backoffFactor = 2,
-    this.jitter = 0.2,
-    this.connectTimeout = const Duration(seconds: 10),
+    Duration initialBackoff = const Duration(milliseconds: 500),
+    Duration maxBackoff = const Duration(seconds: 30),
+    double backoffFactor = 2,
+    double jitter = 0.2,
+    Duration connectTimeout = const Duration(seconds: 10),
     Uint8List? defaultPayload,
     bool autoStart = true,
     Random? random,
-  }) : _connect = connect,
+  }) : this._(
+         connect,
+         null,
+         muxOptions: muxOptions,
+         talkOptions: talkOptions,
+         initialBackoff: initialBackoff,
+         maxBackoff: maxBackoff,
+         backoffFactor: backoffFactor,
+         jitter: jitter,
+         connectTimeout: connectTimeout,
+         defaultPayload: defaultPayload,
+         autoStart: autoStart,
+         random: random,
+       );
+
+  /// A client whose connections [connect] establishes through a binding
+  /// of the connection contract other than the frame mux
+  /// ([ConnectionConnector]), instead of the frame mux over the transports
+  /// of a [TransportConnector]; otherwise exactly the client of the unnamed
+  /// constructor, which describes the parameters. A connection that
+  /// arrives after its attempt was given up ([connectTimeout], [stop],
+  /// [close]) is closed.
+  ReconnectingClient.connections(
+    ConnectionConnector connect, {
+    MuxOptions? muxOptions,
+    TalkOptions? talkOptions,
+    Duration initialBackoff = const Duration(milliseconds: 500),
+    Duration maxBackoff = const Duration(seconds: 30),
+    double backoffFactor = 2,
+    double jitter = 0.2,
+    Duration connectTimeout = const Duration(seconds: 10),
+    Uint8List? defaultPayload,
+    bool autoStart = true,
+    Random? random,
+  }) : this._(
+         null,
+         connect,
+         muxOptions: muxOptions,
+         talkOptions: talkOptions,
+         initialBackoff: initialBackoff,
+         maxBackoff: maxBackoff,
+         backoffFactor: backoffFactor,
+         jitter: jitter,
+         connectTimeout: connectTimeout,
+         defaultPayload: defaultPayload,
+         autoStart: autoStart,
+         random: random,
+       );
+
+  ReconnectingClient._(
+    TransportConnector? connectTransport,
+    ConnectionConnector? connectConnection, {
+    required MuxOptions? muxOptions,
+    required TalkOptions? talkOptions,
+    required this.initialBackoff,
+    required this.maxBackoff,
+    required this.backoffFactor,
+    required this.jitter,
+    required this.connectTimeout,
+    required Uint8List? defaultPayload,
+    required bool autoStart,
+    required Random? random,
+  }) : _connect = connectTransport,
+       _connectConnection = connectConnection,
        muxOptions = muxOptions ?? const MuxOptions(),
        talkOptions = talkOptions ?? const TalkOptions(),
        defaultPayload = defaultPayload ?? Uint8List(0),
@@ -242,7 +322,9 @@ class ReconnectingClient {
     }
   }
 
-  final TransportConnector _connect;
+  // One of the two is set.
+  final TransportConnector? _connect;
+  final ConnectionConnector? _connectConnection;
   final Backoff _schedule;
 
   /// Mux configuration of every connection.
@@ -581,12 +663,41 @@ class ReconnectingClient {
     _attemptToken = token;
     _setState(ClientPhase.connecting, lastStatus ?? _state.lastStatus);
     _log.fine('connecting, attempt $_attempt');
+    final connectConnection = _connectConnection;
+    if (connectConnection != null) {
+      Future<MuxConnection> attempt;
+      try {
+        attempt = connectConnection(muxOptions);
+      } on Object catch (e, st) {
+        attempt = Future.error(e, st);
+      }
+      _awaitAttempt(token, attempt, _onConnection, (connection) {
+        _log.fine('closing a connection that arrived too late');
+        connection.close().ignore();
+      });
+      return;
+    }
     Future<StreamChannel<Uint8List>> attempt;
     try {
-      attempt = _connect();
+      attempt = _connect!();
     } on Object catch (e, st) {
       attempt = Future.error(e, st);
     }
+    _awaitAttempt(token, attempt, _onTransport, (transport) {
+      _log.fine('closing a transport that arrived too late');
+      _discard(transport);
+    });
+  }
+
+  /// Bounds the attempt [token] by [connectTimeout], and hands what
+  /// [attempt] gives to [arrived], or to [late] once the attempt was given
+  /// up.
+  void _awaitAttempt<T>(
+    Object token,
+    Future<T> attempt,
+    void Function(T value) arrived,
+    void Function(T value) late,
+  ) {
     if (identical(_attemptToken, token) && connectTimeout > Duration.zero) {
       _connectTimer = Timer(connectTimeout, () {
         _connectTimer = null;
@@ -603,16 +714,15 @@ class ReconnectingClient {
     }
     attempt
         .then(
-          (transport) {
+          (value) {
             if (!identical(_attemptToken, token)) {
-              _log.fine('closing a transport that arrived too late');
-              _discard(transport);
+              late(value);
               return;
             }
             _attemptToken = null;
             _connectTimer?.cancel();
             _connectTimer = null;
-            _onTransport(transport);
+            arrived(value);
           },
           onError: (Object e, StackTrace st) {
             if (!identical(_attemptToken, token)) {
@@ -677,6 +787,18 @@ class ReconnectingClient {
       _connectFailed(e);
       return;
     }
+    _onConnection(connection);
+  }
+
+  /// [connection], established by the attempt, is the current one.
+  void _onConnection(MuxConnection connection) {
+    try {
+      connection.incoming.listen(_onPeerChannel);
+    } on Object catch (e) {
+      connection.close().ignore();
+      _connectFailed(e);
+      return;
+    }
     final attempt = _attempt;
     _attempt = 0;
     _connection = connection;
@@ -685,7 +807,6 @@ class ReconnectingClient {
       _lifetimeTimer = null;
       _livedLong = true;
     });
-    connection.incoming.listen(_onPeerChannel);
     connection.done
         .then((status) => _onConnectionDone(connection, status))
         .ignore();

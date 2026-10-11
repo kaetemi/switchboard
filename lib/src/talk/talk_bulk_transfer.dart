@@ -447,10 +447,14 @@ class _BulkIn {
     _idleTimer = null;
   }
 
-  /// A chunk arrived or was consumed: the idle timeout restarts.
+  /// A chunk arrived or was consumed: the idle timeout restarts, and that
+  /// of a channel waiting for its payloads after its end.
   void _progressed() {
     if (_idleTimer != null) {
       _lastProgress = monotonicNow();
+    }
+    if (talk._lingering != null) {
+      talk._lingerProgress = monotonicNow();
     }
   }
 
@@ -512,6 +516,7 @@ class _BulkIn {
         if (!_dropping) {
           _onDone?.call(status);
         }
+        talk._checkLinger();
       }),
     );
   }
