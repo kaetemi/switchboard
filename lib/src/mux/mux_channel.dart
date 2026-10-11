@@ -40,9 +40,11 @@ enum MuxChannelState {
 }
 
 /// Output tier of what a side sends on a channel: which of the subframes
-/// waiting for the transport goes first. Local to the sender; nothing about
-/// it goes on the wire. The frame mux's output scheduler orders its frames
-/// by it; a stream binding maps it onto its library's stream priorities.
+/// waiting for the transport goes first. A sender writes the connection's
+/// control messages first, then the ordinary channels, then the bulk ones.
+/// Local to the sender; nothing about it goes on the wire. The frame mux's
+/// output scheduler orders its frames by it; a stream binding maps it onto
+/// its library's stream priorities.
 ///
 /// See the wiki page "Polyverse Switchboard Mux", section "Output
 /// scheduling".
@@ -109,31 +111,39 @@ abstract interface class MuxChannelCarrier {
 /// stream), or a binding that gives each channel a stream of the transport
 /// (QUIC, WebTransport), which extends this class. Every binding honours:
 ///
-/// * Ordering: what one side sends on a channel arrives in order, each
-///   subframe whole, as one event of the peer's [stream] (on a
-///   [MuxPriority.bulk] channel, a payload [send] takes may arrive as
-///   several). Nothing is ordered across channels, nor between a channel
-///   and the connection's control messages (`IDENT` included), except
-///   what [openAfter] promises.
-/// * Close: [close] sends this side's close, carrying a status, after
-///   everything handed to [send] before it. A close from either side ends
-///   the channel in both directions: on the peer's close this side
-///   confirms with its own (unless it closed first), drops what it has not
-///   sent yet (the futures of those sends fail), and ends [stream] once
-///   what arrived before the close is delivered. [done] completes with the
-///   first non-OK status sent or received, else OK; when the connection
-///   ends first, with its end status as [MuxConnection.done] describes. A
+/// * Identity of a channel: a `u48` channel id ([id]), chosen by the side
+///   that opens it (even for the initiator, odd for the acceptor, never a
+///   reserved id) and known to both, and an open payload ([openPayload]),
+///   given by the opener and dispatched on by the receiver.
+/// * Subframes: each side sends subframes, byte strings, possibly empty,
+///   delivered whole and in order, each as one event of the peer's
+///   [stream] (Talk puts one Talk frame in each; on a [MuxPriority.bulk]
+///   channel, a payload [send] takes may arrive as several). Nothing is
+///   ordered across channels, nor between a channel and the connection's
+///   control messages (`IDENT` included); see [openAfter] for what it
+///   promises and what it does not.
+/// * Close: each side closes the channel once, with a status ([close]),
+///   after everything it handed to [send] before; the channel ends when
+///   both sides have closed it. On the peer's close this side closes in
+///   turn at once (unless it closed first), drops what it has not sent yet
+///   (the futures of those sends fail), and ends [stream] once what arrived
+///   before is delivered. A receiver rejects a channel by closing it.
+///   [done] completes with the end status: the first non-OK status a side
+///   saw or sent, else OK; when the connection ends first, its status as
+///   [MuxConnection.done] describes (`GOING_AWAY` or `CONNECTION_LOST`). A
 ///   status with an application code (256 and above) is never sent: a
 ///   received one reads as [StatusCode.unknown] with the code in the
-///   reason, so that it can be relayed with [close].
-/// * Flow control: the peer grants a window per channel, which [send]
-///   takes [sendCost] of per subframe, waiting in order while it lacks
-///   room; this side returns credit as what it received is consumed
-///   (delivered to the [stream]'s listener, or reported with [consumed]
-///   under [manualCredit]) and may raise the window with [grant]. What
-///   each side holds for a channel is thereby bounded by its window, and
-///   a reader that does not read stalls its channel only. [isWritable]
-///   and [whenWritable] tell a sender when the window has room.
+///   reason, so that it can be relayed with [close]. A close need not
+///   carry a reason: a stream binding may close by a reset that carries
+///   the status code only.
+/// * Flow control: what a receiver holds for a channel is bounded by what
+///   it granted, and it grants more as it consumes (as the [stream]'s
+///   listener takes subframes, or as [consumed] reports them under
+///   [manualCredit]; [grant] grants more at once), so that a reader that
+///   stops stalls its own channel and nothing else. [send] takes
+///   [sendCost] of the grant per subframe, waiting in order while it
+///   lacks room; [isWritable] and [whenWritable] tell a sender when it has
+///   room.
 /// * Identity: the channel belongs to its [connection], whose
 ///   [MuxConnection.peerIdentity] is the peer's.
 ///
@@ -147,12 +157,16 @@ abstract class MuxChannel
   /// The connection this channel belongs to.
   MuxConnection get connection;
 
-  /// The channel's number on its [connection], the same at both ends, so
-  /// that either side can name the channel to the other (as a Talk bulk
-  /// channel's `_bulk` open payload names its parent), and unique among the
-  /// connection's channels until they are closed (see
-  /// [MuxConnection.channelWithId]). At most `2^48 - 1`. The frame mux's
-  /// channel id; a stream binding's stream id.
+  /// The channel id: a `u48` chosen by the side that opened the channel
+  /// (even for the initiator, odd for the acceptor, never one of the
+  /// frame mux's reserved ids), the same at both ends, so that either side
+  /// can name the channel to the other (as a Talk bulk channel's `_bulk`
+  /// open payload names its parent), and unique among the connection's
+  /// channels until they end (see [MuxConnection.channelWithId]). Every
+  /// binding carries it: the frame mux in every frame, a stream binding in
+  /// the channel's open record (a stream id is not visible to every
+  /// endpoint, a browser's among them), where an id is used once and
+  /// never reused.
   int get id;
 
   /// Whether the local side opened this channel.
@@ -267,13 +281,15 @@ abstract class MuxChannel
   /// (a slot channel holding subframes while it reopens) counts with it.
   int sendCost(int length);
 
-  /// The largest subframe [send] takes on this channel, in bytes, or a
-  /// negative number when not even an empty one fits.
+  /// The largest subframe the peer accepts, in bytes: what [send] takes
+  /// on this channel in one piece, or a negative number when not even an
+  /// empty one fits. Talk sends a larger message as a bulk payload.
   ///
-  /// It is what the peer accepts in one piece, and its cost at most half
-  /// the window the channel started with, so that a peer returning credit
-  /// in batches of half its window never leaves a subframe waiting for
-  /// ever. Larger payloads go on a channel whose [priority] is
+  /// On the frame mux, half the peer's initial window less the 16 bytes
+  /// of a DATA frame's cost (so that a peer returning credit in batches of
+  /// half its window never leaves a subframe waiting for ever), within the
+  /// frame limit the peer announced; on a stream binding, the peer's record
+  /// limit. Larger payloads go on a channel whose [priority] is
   /// [MuxPriority.bulk], where [send] splits them.
   int get maxSubframeLength;
 
@@ -340,11 +356,16 @@ abstract class MuxChannel
   /// opened ahead of their messages, which an open sent at once could
   /// overtake while the message waits for credit or for the transport.
   /// The frame mux keeps the order on the wire, so the peer receives the
-  /// open before the subframes after the call. A binding that carries
+  /// open before the subframes after the call, and the channels opened
+  /// after one channel in the order of their ids. A binding that carries
   /// channels on separate streams cannot order streams: it opens the new
   /// stream once what this channel sent before the call is handed to the
-  /// transport, and the peer may then see the message first, which Talk
-  /// waits out (`TalkOptions.bulkOpenTimeout`).
+  /// transport, and the peer may then receive the new channel before the
+  /// subframes sent before the call or after them, after this channel
+  /// ended, or out of the order of the ids of the channels opened after
+  /// this one. Talk waits for a bulk channel referenced before it arrived
+  /// (`TalkOptions.bulkOpenTimeout`); its check that bulk numbers arrive
+  /// in increasing order holds on the frame mux only.
   ///
   /// The new channel continues work the connection admitted already, so a
   /// GOAWAY, sent or received, does not refuse it, and a binding admits a
@@ -369,9 +390,10 @@ abstract class MuxChannel
   /// are dropped (their futures fail) and the close goes at once.
   ///
   /// The reason may be shortened on the wire, on a UTF-8 character
-  /// boundary (the status payload stays within 1024 bytes); [done] reports
-  /// [status] as given. The local-only `CONNECTION_LOST` code is sent as
-  /// `UNAVAILABLE`.
+  /// boundary (the status payload stays within 1024 bytes), or not sent
+  /// at all where a stream binding closes by a reset, which carries the
+  /// code only; [done] reports [status] as given. The local-only
+  /// `CONNECTION_LOST` code is sent as `UNAVAILABLE`.
   ///
   /// Completes when the channel is mutually closed or the connection is
   /// lost, whichever comes first, or when the peer did not confirm within

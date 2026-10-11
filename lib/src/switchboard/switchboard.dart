@@ -51,6 +51,7 @@ import 'relay_config.dart';
 import 'resolver.dart';
 import 'slot_channel.dart';
 import 'slot_reopen.dart';
+import 'switchboard_binding.dart';
 
 final Logger _log = Logger('Switchboard.Router');
 
@@ -71,8 +72,11 @@ final Logger _log = Logger('Switchboard.Router');
 ///
 /// Supported endpoint URIs: `ws://host:port/path`, `wss://host:port/path`,
 /// `tcp://host:port` and, within one isolate, `mem://id` (see
-/// [listenMemory]). A URI fragment (the text form of a service address, as
-/// in `ws://host/path#npc/1a2b`) is ignored for connecting. An endpoint of
+/// [listenMemory]), all carried by the frame mux ([MuxConnection]), plus
+/// the schemes of the bindings registered with [registerBinding] (a QUIC
+/// binding, say), which carry the same connection contract their own way.
+/// A URI fragment (the text form of a service address, as in
+/// `ws://host/path#npc/1a2b`) is ignored for connecting. An endpoint of
 /// one of the node's own listeners is reached in-process, without a
 /// socket (see [localConnections]).
 class Switchboard {
@@ -108,6 +112,8 @@ class Switchboard {
   /// slot is given; [random] is the source of [SelectionPolicy.random]
   /// (default: a new [Random]), to be seeded in tests.
   ///
+  /// [bindings] are registered with [registerBinding], in order.
+  ///
   /// [outgoingPolicy], [endpointPolicy] and [credentialFor] govern the
   /// connections this node initiates, for meshes that reach peers they do
   /// not trust (workers on rented machines, say): the policy of the
@@ -139,8 +145,8 @@ class Switchboard {
   /// node that listens nowhere, through a [relay].
   ///
   /// Throws [ArgumentError] when [credential] names a holder key and
-  /// [holderKey] is missing or another, and for a negative
-  /// [identityTimeout].
+  /// [holderKey] is missing or another, for a negative [identityTimeout],
+  /// and for [bindings] that [registerBinding] refuses.
   Switchboard({
     this.resolver,
     Uint8List? defaultPayload,
@@ -164,6 +170,7 @@ class Switchboard {
     this.expectedIdentityFor,
     this.relay,
     this.localConnections = true,
+    Iterable<SwitchboardBinding> bindings = const [],
   }) : defaultPayload = defaultPayload ?? Uint8List(0),
        _identity = credential,
        muxOptions = verifier == null
@@ -189,6 +196,7 @@ class Switchboard {
     if (credential != null) {
       _checkHolderKey(credential);
     }
+    bindings.forEach(registerBinding);
   }
 
   /// The credential this node identifies with (wiki page "Switchboard
@@ -513,6 +521,10 @@ class Switchboard {
   final Expando<_Identification> _identified = Expando<_Identification>(
     'identification',
   );
+  // The registered bindings, by scheme.
+  final Map<String, SwitchboardBinding> _bindings = {};
+  // Connections handed to adopt().
+  final Expando<bool> _adopted = Expando<bool>('adopted');
   // Keyed by the endpoint's pool key, or by the pool key and the policy
   // for a connect() with an explicit policy.
   final Map<Object, List<MuxConnection>> _pool = {};
@@ -1000,17 +1012,136 @@ class Switchboard {
   /// established. Broadcast; ends after [close].
   Stream<MuxConnection> get connections => _connections.stream;
 
+  /// The schemes the node dials besides its built-in ones, through the
+  /// bindings registered with [registerBinding].
+  Set<String> get bindingSchemes => Set.unmodifiable(_bindings.keys);
+
+  /// Has the node dial the endpoints of [binding]'s schemes through it:
+  /// [connect], [dial] and through them the open methods, `PeerSet` and
+  /// the proxy. See [SwitchboardBinding]. Connections already established
+  /// are unaffected.
+  ///
+  /// Throws [ArgumentError] for a scheme the node has built in (`ws`,
+  /// `wss`, `tcp`, `mem`), one another binding registered, or one that is
+  /// not a lower-case URI scheme; nothing is registered then.
+  void registerBinding(SwitchboardBinding binding) {
+    final schemes = binding.schemes.toList();
+    for (final scheme in schemes) {
+      if (!_schemePattern.hasMatch(scheme)) {
+        throw ArgumentError.value(
+          scheme,
+          'binding',
+          'not a lower-case URI scheme',
+        );
+      }
+      if (_builtInSchemes.contains(scheme)) {
+        throw ArgumentError.value(
+          scheme,
+          'binding',
+          'the node dials $scheme endpoints itself',
+        );
+      }
+      if (_bindings.containsKey(scheme)) {
+        throw ArgumentError.value(
+          scheme,
+          'binding',
+          'another binding dials $scheme endpoints',
+        );
+      }
+    }
+    for (final scheme in schemes) {
+      _bindings[scheme] = binding;
+    }
+  }
+
+  static const Set<String> _builtInSchemes = {
+    'ws',
+    'wss',
+    'tcp',
+    MemoryEndpoints.scheme,
+  };
+
+  static final RegExp _schemePattern = RegExp(r'^[a-z][a-z0-9+.-]*$');
+
+  /// Adopts [connection], established by any binding, exactly like a
+  /// connection a listener of this node accepts: what [accept] does for a
+  /// transport the frame mux is to run over. This is how the connections
+  /// a [SwitchboardBinding]'s listener accepts join the node.
+  ///
+  /// [policy] is the listener policy of every channel the peer opens on
+  /// it (null allows everything; **a connection from untrusted peers must
+  /// have one** that refuses the reserved types, see [listenWebSocket]),
+  /// and those channels are dispatched to the local services; the
+  /// connection appears on [connections], its
+  /// [MuxConnection.localIdentity] is set from [credential], and [close]
+  /// sends it GOAWAY and waits for it. A peer that identifies with the
+  /// intent of a [broker] attempt is that attempt's connection. [remote]
+  /// describes the peer in logs and in [IncomingChannel.remote]; default
+  /// `'external'`.
+  ///
+  /// The connection is usually an accepted one
+  /// ([MuxConnection.isInitiator] false); one this side initiated is
+  /// adopted the same way, but neither pooled nor identified on (dial
+  /// through a registered binding for that). Hand it over as soon as it is
+  /// established: the node must read [MuxConnection.incoming] itself, and
+  /// an `IDENT` that names this node is refused while
+  /// [MuxConnection.localIdentity] is not set yet.
+  ///
+  /// Throws [ArgumentError] if [connection] was adopted by this node
+  /// already, and [StateError] if something else listens to its
+  /// [MuxConnection.incoming]. Throws [SwitchboardException] with
+  /// [StatusCode.failedPrecondition] once [close] has started; the
+  /// connection is then adopted all the same and sent GOAWAY at once, as
+  /// with [accept].
+  Future<MuxConnection> adopt(
+    MuxConnection connection, {
+    ChannelPolicy? policy,
+    String? remote,
+  }) async {
+    if (_adopted[connection] ?? false) {
+      throw ArgumentError.value(
+        connection,
+        'connection',
+        'adopted by this node already',
+      );
+    }
+    _adopted[connection] = true;
+    _adoptConnection(
+      connection,
+      isInitiator: connection.isInitiator,
+      remote: remote ?? 'external',
+      policy: policy,
+    );
+    if (_closing) {
+      // Adopted while closing: it goes away at once and close() waits for
+      // it.
+      throw _closedException();
+    }
+    return connection;
+  }
+
+  /// Runs the frame mux over [transport] and adopts the connection.
   MuxConnection _adopt(
     StreamChannel<Uint8List> transport, {
     required bool isInitiator,
     String? remote,
     ChannelPolicy? policy,
+  }) => _adoptConnection(
+    MuxConnection(transport, isInitiator: isInitiator, options: muxOptions),
+    isInitiator: isInitiator,
+    remote: remote,
+    policy: policy,
+  );
+
+  /// Adopts [connection], of any binding: dispatch under [policy],
+  /// [connections], GOAWAY on [close].
+  MuxConnection _adoptConnection(
+    MuxConnection connection, {
+    required bool isInitiator,
+    String? remote,
+    ChannelPolicy? policy,
   }) {
-    final connection = MuxConnection(
-      transport,
-      isInitiator: isInitiator,
-      options: muxOptions,
-    )..localIdentity = _identity?.identity;
+    connection.localIdentity = _identity?.identity;
     if (remote != null) {
       _remotes[connection] = remote;
     }
@@ -1022,11 +1153,12 @@ class Switchboard {
       _lateShutdowns.add(connection.goAway());
       return connection;
     }
+    // First: throws for a connection whose channels something else reads.
+    connection.incoming.listen((channel) => _dispatch(connection, channel));
     _live.add(connection);
     _log.fine(
       '${isInitiator ? 'connected to' : 'accepted connection from'} $remote',
     );
-    connection.incoming.listen((channel) => _dispatch(connection, channel));
     unawaited(
       connection.done.then((status) {
         _live.remove(connection);
@@ -1238,15 +1370,21 @@ class Switchboard {
           };
   }
 
-  static String _poolKey(Uri endpoint) => _normalised(endpoint).toString();
+  String _poolKey(Uri endpoint) => _normalised(endpoint).toString();
 
   /// [endpoint] as the pool tells endpoints apart (see [connect]): scheme
   /// and host lower-cased, the default port filled in, the path (`/` when
   /// empty) and query kept for WebSocket URIs only, no fragment; a `mem`
-  /// URI is its id alone. What [endpointPolicy] is asked about, so that
-  /// every spelling of one endpoint gets the same policy.
-  static Uri _normalised(Uri endpoint) {
+  /// URI is its id alone; for the scheme of a registered binding, what the
+  /// binding's [SwitchboardBinding.normalise] gives. What [endpointPolicy]
+  /// is asked about, so that every spelling of one endpoint gets the same
+  /// policy.
+  Uri _normalised(Uri endpoint) {
     final scheme = endpoint.scheme.toLowerCase();
+    final binding = _bindings[scheme];
+    if (binding != null) {
+      return binding.normalise(endpoint);
+    }
     final host = endpoint.host.toLowerCase();
     if (scheme == MemoryEndpoints.scheme) {
       return Uri(scheme: scheme, host: host);
@@ -1299,10 +1437,14 @@ class Switchboard {
     String? receiver,
     ServiceRecord? record,
   }) async {
-    final StreamChannel<Uint8List> transport;
+    StreamChannel<Uint8List>? transport;
+    MuxConnection? established;
     final own = localConnections ? _ownListener(endpoint) : null;
+    final binding = _bindings[endpoint.scheme.toLowerCase()];
     if (own != null) {
       transport = _connectLocal(own);
+    } else if (binding != null) {
+      established = await _connectBinding(binding, endpoint);
     } else {
       switch (endpoint.scheme.toLowerCase()) {
         case 'ws' || 'wss':
@@ -1318,13 +1460,22 @@ class Switchboard {
           );
       }
     }
-    final connection = _adopt(
-      transport,
-      isInitiator: true,
-      remote: endpoint.toString(),
-      policy:
-          policy ?? _endpointPolicyOf(_normalised(endpoint)) ?? outgoingPolicy,
-    );
+    final remote = endpoint.toString();
+    final connectionPolicy =
+        policy ?? _endpointPolicyOf(_normalised(endpoint)) ?? outgoingPolicy;
+    final connection = established == null
+        ? _adopt(
+            transport!,
+            isInitiator: true,
+            remote: remote,
+            policy: connectionPolicy,
+          )
+        : _adoptConnection(
+            established,
+            isInitiator: true,
+            remote: remote,
+            policy: connectionPolicy,
+          );
     _dialled[connection] = endpoint;
     if (_closing) {
       // Adopted while closing: it goes away at once and close() waits for
@@ -1492,6 +1643,47 @@ class Switchboard {
     } on Object catch (e, st) {
       _log.warning('endpoint policy failed for $endpoint', e, st);
       return ChannelPolicies.denyAll;
+    }
+  }
+
+  /// Dials [endpoint] through [binding], bounded by [connectTimeout]; a
+  /// connection that arrives later is closed. Errors other than
+  /// [SwitchboardException]s become [StatusCode.unavailable].
+  Future<MuxConnection> _connectBinding(
+    SwitchboardBinding binding,
+    Uri endpoint,
+  ) async {
+    Future<MuxConnection> attempt;
+    try {
+      attempt = binding.dial(
+        endpoint,
+        BindingDialSettings(
+          options: muxOptions,
+          timeout: connectTimeout,
+          localIdentity: _identity?.identity,
+        ),
+      );
+    } on Object catch (e, st) {
+      attempt = Future.error(e, st);
+    }
+    try {
+      return connectTimeout > Duration.zero
+          ? await attempt.timeout(connectTimeout)
+          : await attempt;
+    } on TimeoutException {
+      // Close the connection if it completes after we gave up on it.
+      attempt.then((connection) => connection.close()).ignore();
+      throw SwitchboardException.of(
+        StatusCode.unavailable,
+        'cannot connect to $endpoint: timed out after $connectTimeout',
+      );
+    } on SwitchboardException {
+      rethrow;
+    } on Object catch (e) {
+      throw SwitchboardException.of(
+        StatusCode.unavailable,
+        'cannot connect to $endpoint: $e',
+      );
     }
   }
 

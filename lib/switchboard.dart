@@ -12,7 +12,8 @@ Authors:
 ///
 /// Everything in `package:switchboard/core.dart` plus the `dart:io` parts:
 /// the TCP stream transport, the server side WebSocket transports, the
-/// `Switchboard` mesh node, `MeshNode` (a node joined to a naming service),
+/// `Switchboard` mesh node and the `SwitchboardBinding`s that extend the
+/// schemes it dials, `MeshNode` (a node joined to a naming service),
 /// `namingClientFor`, `PeerSet` (a connected set of the instances of a
 /// type), the `_relay` service (`RelayService`, `RelayConfig`), and the
 /// instance side of sharding (`SlotGate`, `SlotLifecycle`, `SlotGates`,
@@ -32,6 +33,7 @@ export 'src/switchboard/relay_config.dart';
 export 'src/switchboard/slot_channel.dart';
 export 'src/switchboard/slot_gate.dart';
 export 'src/switchboard/switchboard.dart';
+export 'src/switchboard/switchboard_binding.dart';
 export 'src/transport/stream_transport.dart';
 export 'src/transport/web_socket_server.dart';
 export 'src/transport/web_socket_transport_io.dart';

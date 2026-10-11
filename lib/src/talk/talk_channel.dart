@@ -124,8 +124,9 @@ class TalkOptions {
   /// Sending: the largest message, in encoded bytes (header included),
   /// sent inline; a larger one goes as a bulk payload (see
   /// [TalkMessage.isBulk]). Null, the default, is the channel's own limit
-  /// ([MuxChannel.maxSubframeLength]: half the peer's initial window, less
-  /// the frame overhead), so that a payload goes bulk only when it must; a
+  /// ([MuxChannel.maxSubframeLength], the largest subframe the peer
+  /// accepts: on the frame mux half the peer's initial window, less the
+  /// frame overhead), so that a payload goes bulk only when it must; a
   /// lower value sends bulk earlier. Only over a mux channel; over any
   /// other `StreamChannel` every message goes inline.
   final int? bulkThreshold;
