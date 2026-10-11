@@ -33,10 +33,12 @@ import 'switchboard.dart';
 ///
 /// The connections a binding accepts, from a listener of its own, go to
 /// [Switchboard.adopt], which treats them as a listener of the node would
-/// its own. A binding's listener endpoints are published explicitly
-/// (`MeshNode.publish`'s `endpoints`); the node does not list them in
-/// [Switchboard.listeningEndpoints], and does not recognise them as its
-/// own ([Switchboard.isOwnEndpoint]).
+/// its own. The endpoint of such a listener is declared to the node with
+/// [Switchboard.addListeningEndpoint], with the policy the listener adopts
+/// its connections with: it is then in [Switchboard.listeningEndpoints],
+/// and an own endpoint ([Switchboard.isOwnEndpoint]) that the proxy, the
+/// relay and slot gate forwarding never connect to, and that the node
+/// reaches in-process ([Switchboard.localConnections]).
 ///
 /// See `doc/dart-design.md`, section "Binding seam".
 abstract class SwitchboardBinding {
@@ -47,9 +49,10 @@ abstract class SwitchboardBinding {
   /// Read once, when the binding is registered.
   Set<String> get schemes;
 
-  /// Establishes a connection to [endpoint], whose scheme is one of
+  /// Establishes a new connection to [endpoint], whose scheme is one of
   /// [schemes], as its initiator ([MuxConnection.isInitiator] true), and
-  /// returns it once it can open channels.
+  /// returns it once it can open channels. The node reads its
+  /// [MuxConnection.incoming] and owns it from then on.
   ///
   /// The connection is configured with [settings]: the node's
   /// [BindingDialSettings.options] (its identity verifier among them) and

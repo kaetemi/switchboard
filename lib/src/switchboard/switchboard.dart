@@ -362,8 +362,10 @@ class Switchboard {
   final int maxConnectionsPerEndpoint;
 
   /// Whether a connection this node initiates to one of its own listeners
-  /// (an endpoint [isOwnEndpoint] recognises, TCP, WebSocket or `mem`) is
-  /// made in-process instead of through a socket. Default true.
+  /// (an endpoint [isOwnEndpoint] recognises: TCP, WebSocket, `mem`, or
+  /// one a binding's listener serves, declared with
+  /// [addListeningEndpoint]) is made in-process instead of through a
+  /// socket or the binding. Default true.
   ///
   /// Such a connection is a [MemoryTransport] pair (frames delivered
   /// through the event queue, as from a socket): one side is adopted as
@@ -786,26 +788,134 @@ class Switchboard {
     final own = _OwnEndpoint(uri, _hostsOf(bound), policy);
     _ownEndpoints.add(own);
     _log.info('listening on $uri');
-    if (bound.address == InternetAddress.anyIPv4.address ||
-        bound.address == InternetAddress.anyIPv6.address) {
-      // Any address of this host reaches a wildcard listener.
-      try {
-        for (final interface in await NetworkInterface.list(
-          includeLoopback: true,
-          includeLinkLocal: true,
-        )) {
-          for (final a in interface.addresses) {
-            if (bound.type == InternetAddressType.IPv6 ||
-                a.type == InternetAddressType.IPv4) {
-              own.hosts.add(_canonicalHost(a.address));
-            }
+    await _addInterfaceHosts(own, bound);
+    return uri;
+  }
+
+  /// Any address of this host reaches a listener bound to a wildcard
+  /// address: adds those of the local network interfaces to [own].
+  static Future<void> _addInterfaceHosts(
+    _OwnEndpoint own,
+    InternetAddress bound,
+  ) async {
+    if (bound.address != InternetAddress.anyIPv4.address &&
+        bound.address != InternetAddress.anyIPv6.address) {
+      return;
+    }
+    try {
+      for (final interface in await NetworkInterface.list(
+        includeLoopback: true,
+        includeLinkLocal: true,
+      )) {
+        for (final a in interface.addresses) {
+          if (bound.type == InternetAddressType.IPv6 ||
+              a.type == InternetAddressType.IPv4) {
+            own.hosts.add(_canonicalHost(a.address));
           }
         }
-      } on Object catch (e) {
-        _log.fine('cannot list network interfaces: $e');
+      }
+    } on Object catch (e) {
+      _log.fine('cannot list network interfaces: $e');
+    }
+  }
+
+  /// Declares [endpoint], where the listener of a binding
+  /// ([SwitchboardBinding]) accepts the connections it hands to [adopt],
+  /// as a listener of this node: it is in [listeningEndpoints] (which
+  /// `MeshNode.publish` publishes by default) and [isOwnEndpoint]
+  /// recognises it, so that the proxy, the relay and slot gate forwarding
+  /// never connect to it, and the node reaches it in-process, as its other
+  /// listeners ([localConnections]): over the frame mux, the accepted side
+  /// adopted under [policy]. [policy] is therefore the listener policy the
+  /// binding's listener adopts its connections with, which the node cannot
+  /// learn otherwise.
+  ///
+  /// [endpoint] is compared with others as the binding of its scheme
+  /// normalises them ([SwitchboardBinding.normalise]; its default when no
+  /// binding of the scheme is registered), apart from the host, which
+  /// matches [endpoint]'s own and, given the [address] the listener is
+  /// bound to (by default [endpoint]'s host when that is an IP address),
+  /// what reaches a TCP listener bound there ([isOwnEndpoint]).
+  ///
+  /// Throws [ArgumentError] for a scheme the node listens on itself
+  /// (`ws`, `wss`, `tcp`, `mem`) and for an endpoint declared already, and
+  /// [SwitchboardException] with [StatusCode.failedPrecondition] once
+  /// [close] has started, which forgets every declared endpoint.
+  Future<void> addListeningEndpoint(
+    Uri endpoint, {
+    ChannelPolicy? policy,
+    InternetAddress? address,
+  }) async {
+    _checkOpen();
+    final scheme = endpoint.scheme.toLowerCase();
+    if (_builtInSchemes.contains(scheme)) {
+      throw ArgumentError.value(
+        endpoint,
+        'endpoint',
+        'the node listens on $scheme endpoints itself',
+      );
+    }
+    if (_declaredEndpoint(endpoint) != null) {
+      throw ArgumentError.value(endpoint, 'endpoint', 'declared already');
+    }
+    final host = _canonicalHost(endpoint.host);
+    final bound = address ?? InternetAddress.tryParse(host);
+    final own = _OwnEndpoint(
+      endpoint,
+      {host, if (bound != null) ..._hostsOf(bound)},
+      policy,
+      viaBinding: true,
+    );
+    _endpoints.add(endpoint);
+    _ownEndpoints.add(own);
+    _log.info('listening on $endpoint (a binding\'s listener)');
+    if (bound != null) {
+      await _addInterfaceHosts(own, bound);
+    }
+  }
+
+  /// Withdraws [endpoint], declared with [addListeningEndpoint] (in any
+  /// spelling that designates the same endpoint and host): it is no longer
+  /// listed nor recognised as the node's own. False when it was not
+  /// declared.
+  bool removeListeningEndpoint(Uri endpoint) {
+    final own = _declaredEndpoint(endpoint);
+    if (own == null) {
+      return false;
+    }
+    _ownEndpoints.remove(own);
+    _endpoints.remove(own.uri);
+    return true;
+  }
+
+  /// The endpoint declared with [addListeningEndpoint] that [endpoint]
+  /// spells, host included, or null.
+  _OwnEndpoint? _declaredEndpoint(Uri endpoint) {
+    final host = _canonicalHost(endpoint.host);
+    for (final own in _ownEndpoints) {
+      if (own.viaBinding &&
+          _canonicalHost(own.uri.host) == host &&
+          _sameBindingEndpoint(own.uri, endpoint)) {
+        return own;
       }
     }
-    return uri;
+    return null;
+  }
+
+  /// Whether [a] and [b] designate the same endpoint of a binding, the
+  /// host apart: as the binding of their scheme normalises them.
+  bool _sameBindingEndpoint(Uri a, Uri b) {
+    final scheme = a.scheme.toLowerCase();
+    if (b.scheme.toLowerCase() != scheme) {
+      return false;
+    }
+    final binding = _bindings[scheme] ?? const _UnregisteredBinding();
+    final x = binding.normalise(a);
+    final y = binding.normalise(b);
+    return x.scheme == y.scheme &&
+        x.port == y.port &&
+        x.path == y.path &&
+        x.query == y.query;
   }
 
   /// Host names that designate a listener bound to [bound]: the address
@@ -851,8 +961,9 @@ class Switchboard {
   /// addresses, the host name and the addresses of the local network
   /// interfaces. Host names that resolve to this host by other means are
   /// not recognised. A `mem` URI matches by its id alone
-  /// ([listenMemory]). Nothing matches once [close] has started, which
-  /// stops every listener.
+  /// ([listenMemory]). An endpoint of a binding's listener matches once
+  /// declared with [addListeningEndpoint]. Nothing matches once [close]
+  /// has started, which stops every listener.
   ///
   /// The node connects to such an endpoint in-process (see
   /// [localConnections]); the proxy never forwards to one.
@@ -867,6 +978,13 @@ class Switchboard {
     final isWs = scheme == 'ws' || scheme == 'wss';
     final path = isWs ? _normalizePath(endpoint.path) : '';
     for (final own in _ownEndpoints) {
+      if (own.viaBinding) {
+        if (own.hosts.contains(host) &&
+            _sameBindingEndpoint(own.uri, endpoint)) {
+          return own;
+        }
+        continue;
+      }
       if (own.uri.scheme == scheme &&
           own.uri.port == port &&
           (!isWs || own.uri.path == path) &&
@@ -878,7 +996,8 @@ class Switchboard {
   }
 
   /// The URIs returned by [listenWebSocket], [listenTcp] and
-  /// [listenMemory], until [close].
+  /// [listenMemory], and those declared with [addListeningEndpoint], in
+  /// that order of the calls, until [close].
   List<Uri> get listeningEndpoints => List.unmodifiable(_endpoints);
 
   static String _normalizePath(String path) {
@@ -1070,7 +1189,8 @@ class Switchboard {
   /// Adopts [connection], established by any binding, exactly like a
   /// connection a listener of this node accepts: what [accept] does for a
   /// transport the frame mux is to run over. This is how the connections
-  /// a [SwitchboardBinding]'s listener accepts join the node.
+  /// a [SwitchboardBinding]'s listener accepts join the node; declare the
+  /// listener's endpoint with [addListeningEndpoint].
   ///
   /// [policy] is the listener policy of every channel the peer opens on
   /// it (null allows everything; **a connection from untrusted peers must
@@ -1163,7 +1283,7 @@ class Switchboard {
       _lateShutdowns.add(shutdown);
       // adopt() remains callable after close() has finished draining this
       // list. A completed shutdown must not stay retained by the node.
-      unawaited(shutdown.then((_) => _lateShutdowns.remove(shutdown)));
+      shutdown.whenComplete(() => _lateShutdowns.remove(shutdown)).ignore();
       return connection;
     }
     _live.add(connection);
@@ -3177,9 +3297,26 @@ class _Identification {
 /// A listening endpoint, the host names that designate it, and the policy
 /// of the connections its listener accepts.
 class _OwnEndpoint {
-  _OwnEndpoint(this.uri, this.hosts, this.policy);
+  _OwnEndpoint(this.uri, this.hosts, this.policy, {this.viaBinding = false});
 
   final Uri uri;
   final Set<String> hosts;
   final ChannelPolicy? policy;
+
+  /// Declared with [Switchboard.addListeningEndpoint]: compared as its
+  /// binding normalises endpoints.
+  final bool viaBinding;
+}
+
+/// The default [SwitchboardBinding.normalise], for the endpoints of a
+/// scheme no binding is registered for.
+class _UnregisteredBinding extends SwitchboardBinding {
+  const _UnregisteredBinding();
+
+  @override
+  Set<String> get schemes => const {};
+
+  @override
+  Future<MuxConnection> dial(Uri endpoint, BindingDialSettings settings) =>
+      throw UnsupportedError('not a binding');
 }

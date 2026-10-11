@@ -612,12 +612,15 @@ class MuxConnection {
   /// directions; a cumulative transport stream-id limit is not this value.
   int get peerMaxChannels => _peerLimits?.maxChannels ?? 0;
 
-  /// Whether opens created by [MuxChannel.openAfter] on one parent are
-  /// received in call order, in order with that parent's subframes and
-  /// close. This does not order unrelated channels' opens.
-  /// True for the frame mux; false for independent streams. Talk uses
-  /// this guarantee to reject out-of-order bulk opens only where they
-  /// cannot be caused by the binding. Control ordering is separate.
+  /// Whether the channels [MuxChannel.openAfter] opens reach the peer in
+  /// order with their parent's subframes and close, and in call order:
+  /// true for the frame mux, false for a binding whose channels are
+  /// independent streams ([BindingConnection]). Where it is false, a
+  /// `_bulk` channel may arrive before its parent, after its parent
+  /// ended, or out of number order, and Talk and the channel proxy apply
+  /// the rules of the binding specification instead of the frame mux's
+  /// (see [MuxChannel.openAfter]). It says nothing about the order of
+  /// unrelated channels, nor of channels and control messages.
   bool get hasOrderedChannels => true;
 
   /// Number of channels not yet mutually closed, in both directions.
@@ -1031,7 +1034,8 @@ class MuxConnection {
   /// The local-only `CONNECTION_LOST` code is sent as `UNAVAILABLE`, while
   /// the local end status retains the given code.
   ///
-  /// Throws [ArgumentError] synchronously for application status codes.
+  /// Throws [ArgumentError] synchronously for application status codes;
+  /// the future never completes with an error.
   Future<void> goAway([Status status = const Status(33)]) {
     checkMuxStatus(status);
     if (_closing) {

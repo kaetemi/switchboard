@@ -287,18 +287,18 @@ abstract class MuxChannel
 
   /// The largest subframe the peer accepts, in bytes: what [send] takes
   /// on this channel in one piece, or a negative number when not even an
-  /// empty one fits. Talk sends a larger message as a bulk payload.
-  /// An accepted ordinary subframe must be able to make progress under
-  /// the binding's credit-return policy when the receiver keeps consuming;
-  /// a record limit larger than the available receive capacity is not
-  /// by itself a safe value for this member.
+  /// empty one fits. Talk sends a larger message as a bulk payload. A
+  /// subframe of this length must make progress whenever the receiver
+  /// keeps reading.
   ///
   /// On the frame mux, half the peer's initial window less the 16 bytes
   /// of a DATA frame's cost (so that a peer returning credit in batches of
   /// half its window never leaves a subframe waiting for ever), within the
   /// frame limit the peer announced; on a stream binding, the peer's record
-  /// limit. Larger payloads go on a channel whose [priority] is
-  /// [MuxPriority.bulk], where [send] splits them.
+  /// limit (its receiver reads the record in progress whatever the window,
+  /// so a record within the limit always arrives). Larger payloads go on a
+  /// channel whose [priority] is [MuxPriority.bulk], where [send] splits
+  /// them.
   int get maxSubframeLength;
 
   /// Sends one subframe, which may be empty.
@@ -371,13 +371,18 @@ abstract class MuxChannel
   /// transport, and the peer may then receive the new channel before the
   /// subframes sent before the call or after them, after this channel
   /// ended, or out of the order of the ids of the channels opened after
-  /// this one. Talk waits for a bulk channel referenced before it arrived
-  /// (`TalkOptions.bulkOpenTimeout`); its check that bulk numbers arrive
-  /// in increasing order applies only with
-  /// [MuxConnection.hasOrderedChannels]. A bulk open arriving before
-  /// its parent is held within a bounded backlog until the parent is
-  /// dispatched. Once the parent has ended it is refused: Talk's graceful
-  /// close waits for its outgoing bulk transfers before closing the parent.
+  /// this one ([MuxConnection.hasOrderedChannels] false). The receiver
+  /// then applies the rules of the binding specification (wiki page
+  /// "Polyverse Switchboard QUIC and WebTransport Binding", section "Bulk
+  /// payloads"), which give every case the outcome it has over the frame
+  /// mux: a bulk channel whose parent has not arrived is held, in a
+  /// backlog bounded per connection and in time; one whose parent ended
+  /// gracefully is admitted if a message referencing it arrived before
+  /// the close, the reader waiting for it within a bound on the ended
+  /// parents kept waiting per connection; bulk numbers are matched with
+  /// their references, which arrive in order on the parent, instead of
+  /// arriving in increasing order themselves. Talk and the channel proxy
+  /// apply them.
   ///
   /// The new channel continues work the connection admitted already, so a
   /// GOAWAY, sent or received, does not refuse it, and a binding admits a
