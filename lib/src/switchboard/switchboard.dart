@@ -7,6 +7,7 @@ Authors:
   Claude Fable 5.1 <noreply@anthropic.com>
   Claude Opus 5.5 <noreply@anthropic.com>
   GPT-6 Astra <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 import 'dart:async';
@@ -523,7 +524,7 @@ class Switchboard {
   );
   // The registered bindings, by scheme.
   final Map<String, SwitchboardBinding> _bindings = {};
-  // Connections handed to adopt().
+  // Connections adopted through any entry point, including dial/accept.
   final Expando<bool> _adopted = Expando<bool>('adopted');
   // Keyed by the endpoint's pool key, or by the pool key and the policy
   // for a connect() with an explicit policy.
@@ -1024,7 +1025,10 @@ class Switchboard {
   /// Throws [ArgumentError] for a scheme the node has built in (`ws`,
   /// `wss`, `tcp`, `mem`), one another binding registered, or one that is
   /// not a lower-case URI scheme; nothing is registered then.
+  /// Throws [SwitchboardException] with [StatusCode.failedPrecondition]
+  /// after [close] has started.
   void registerBinding(SwitchboardBinding binding) {
+    _checkOpen();
     final schemes = binding.schemes.toList();
     for (final scheme in schemes) {
       if (!_schemePattern.hasMatch(scheme)) {
@@ -1087,8 +1091,9 @@ class Switchboard {
   /// an `IDENT` that names this node is refused while
   /// [MuxConnection.localIdentity] is not set yet.
   ///
-  /// Throws [ArgumentError] if [connection] was adopted by this node
-  /// already, and [StateError] if something else listens to its
+  /// Throws [ArgumentError] if this node owns [connection] already
+  /// (including through [accept], [connect] or [dial]), and [StateError]
+  /// if something else listens to its
   /// [MuxConnection.incoming]. Throws [SwitchboardException] with
   /// [StatusCode.failedPrecondition] once [close] has started; the
   /// connection is then adopted all the same and sent GOAWAY at once, as
@@ -1098,14 +1103,6 @@ class Switchboard {
     ChannelPolicy? policy,
     String? remote,
   }) async {
-    if (_adopted[connection] ?? false) {
-      throw ArgumentError.value(
-        connection,
-        'connection',
-        'adopted by this node already',
-      );
-    }
-    _adopted[connection] = true;
     _adoptConnection(
       connection,
       isInitiator: connection.isInitiator,
@@ -1141,6 +1138,18 @@ class Switchboard {
     String? remote,
     ChannelPolicy? policy,
   }) {
+    if (_adopted[connection] ?? false) {
+      throw ArgumentError.value(
+        connection,
+        'connection',
+        'adopted by this node already',
+      );
+    }
+    // Validate ownership before changing metadata on an existing connection.
+    if (!_closing) {
+      connection.incoming.listen((channel) => _dispatch(connection, channel));
+    }
+    _adopted[connection] = true;
     connection.localIdentity = _identity?.identity;
     if (remote != null) {
       _remotes[connection] = remote;
@@ -1150,11 +1159,13 @@ class Switchboard {
     }
     if (_closing) {
       _log.fine('closing, refusing connection from $remote');
-      _lateShutdowns.add(connection.goAway());
+      final shutdown = connection.goAway();
+      _lateShutdowns.add(shutdown);
+      // adopt() remains callable after close() has finished draining this
+      // list. A completed shutdown must not stay retained by the node.
+      unawaited(shutdown.then((_) => _lateShutdowns.remove(shutdown)));
       return connection;
     }
-    // First: throws for a connection whose channels something else reads.
-    connection.incoming.listen((channel) => _dispatch(connection, channel));
     _live.add(connection);
     _log.fine(
       '${isInitiator ? 'connected to' : 'accepted connection from'} $remote',

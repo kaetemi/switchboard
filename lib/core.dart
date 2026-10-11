@@ -6,6 +6,7 @@ Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Fable 5.1 <noreply@anthropic.com>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 /// Platform independent core of Switchboard: status codes, names, byte
@@ -43,7 +44,17 @@ export 'src/mux/mux_frame.dart'
         MuxCredit,
         MuxFrame,
         MuxLimits;
-export 'src/mux/mux_protocol.dart' show MuxIdent, verifyIdent;
+export 'src/mux/mux_protocol.dart'
+    show
+        MuxIdent,
+        checkMuxStatus,
+        decodeStatusPayload,
+        identReceiverProblem,
+        maxControlPayloadLength,
+        statusForWire,
+        statusFromWire,
+        truncateStatus,
+        verifyIdent;
 export 'src/name.dart';
 export 'src/naming/naming_client.dart';
 export 'src/naming/naming_protocol.dart';

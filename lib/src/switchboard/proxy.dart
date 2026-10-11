@@ -7,6 +7,7 @@ Authors:
   Claude Fable 5.1 <noreply@anthropic.com>
   Claude Opus 5.5 <noreply@anthropic.com>
   GPT-6 Astra <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 import 'dart:async';
@@ -23,6 +24,7 @@ import '../name.dart';
 import '../naming/naming_protocol.dart';
 import '../status.dart';
 import '../talk/talk_bulk.dart';
+import '../talk/talk_frame.dart';
 import 'forwarding.dart';
 import 'generic_status.dart';
 import 'incoming_channel.dart';
@@ -127,10 +129,10 @@ Future<void> _pipe(
   }
   try {
     // Before listening: a bulk channel may wait for its parent's target.
-    _routeBulk(a, b, towardB, bound: bulkBound);
-    _routeBulk(b, a, towardA);
-    _forward(a, b, twins: towardB, bulk: bulk);
-    _forward(b, a, rewrite: toA, twins: towardA, bulk: bulk);
+    final orderA = _routeBulk(a, b, towardB, bound: bulkBound);
+    final orderB = _routeBulk(b, a, towardA);
+    _forward(a, b, twins: towardB, bulk: bulk, bulkOrder: orderA);
+    _forward(b, a, rewrite: toA, twins: towardA, bulk: bulk, bulkOrder: orderB);
   } on Object catch (e) {
     _log.warning('proxy: cannot pipe channels ${a.id} and ${b.id}: $e');
     final status = Status.of(StatusCode.internal, 'cannot pipe channels');
@@ -225,7 +227,7 @@ class _SlotEnd implements _End {
 /// Forwards the bulk channels the peer of [from] opens for it toward [to]
 /// (see [pipeChannels]). A slot channel that replaces [from]'s mux channel
 /// keeps the route.
-void _routeBulk(
+_BulkOrder? _routeBulk(
   _End from,
   _End to,
   Set<_BulkTwin> twins, {
@@ -234,12 +236,132 @@ void _routeBulk(
   final mux = from.mux;
   if (BulkRoutes.isBulk(mux)) {
     // A bulk channel is never a parent.
-    return;
+    return null;
   }
-  BulkRoutes.register(
-    mux,
+  final order = _BulkOrder(
+    from,
     (bulk, number) => _forwardBulk(bulk, number, from, to, twins, bound),
+    bound,
   );
+  BulkRoutes.register(mux, order.open);
+  for (final end in [from, to]) {
+    unawaited(
+      end.done.then((status) {
+        if (!status.isOk) order.clear();
+      }),
+    );
+  }
+  unawaited(Future.wait([from.done, to.done]).then((_) => order.clear()));
+  return order;
+}
+
+/// An independent stream can deliver bulk opens in reverse number order.
+/// The parent carries their references in order, so use those to order
+/// forwarded opens even when the destination is the frame mux. Data is
+/// never rewritten or delayed here; a reference may precede its open and
+/// the destination's existing bulk-open wait handles that gap.
+class _BulkOrder {
+  _BulkOrder(this.from, this.forward, this.bound);
+
+  final _End from;
+  final BulkTarget forward;
+  final ForwardingBound? bound;
+  final Map<int, (MuxChannel, Timer)> _opens = {};
+  final Map<int, Timer> _references = {};
+  int _highestReference = 0;
+  bool _ended = false;
+
+  void open(MuxChannel channel, int number) {
+    if (_ended) {
+      unawaited(channel.close(genericStatus(StatusCode.cancelled)));
+      return;
+    }
+    if (from.mux.connection.hasOrderedChannels) {
+      forward(channel, number);
+      return;
+    }
+    if (_opens.containsKey(number) ||
+        (number <= _highestReference && !_references.containsKey(number))) {
+      unawaited(channel.close(genericStatus(StatusCode.cancelled)));
+      return;
+    }
+    if (_opens.length >= BulkRoutes.maxHeld) {
+      unawaited(channel.close(genericStatus(StatusCode.resourceExhausted)));
+      return;
+    }
+    if (bound != null && !bound!.enter(channel.connection)) {
+      unawaited(channel.close(genericStatus(StatusCode.resourceExhausted)));
+      return;
+    }
+    final timer = Timer(BulkRoutes.heldTimeout, () {
+      _opens.remove(number);
+      bound?.exit(channel.connection);
+      unawaited(channel.close(genericStatus(StatusCode.cancelled)));
+    });
+    _opens[number] = (channel, timer);
+    _drain();
+  }
+
+  void observe(Uint8List bytes) {
+    if (_ended || from.mux.connection.hasOrderedChannels) return;
+    final TalkFrame frame;
+    try {
+      frame = TalkFrame.decode(bytes);
+    } on ProtocolException {
+      return; // Non-Talk subframes still pass through unchanged.
+    }
+    if (!frame.bulk) return;
+    final number = frame.bulkReference.number;
+    if (number <= _highestReference) return;
+    _highestReference = number;
+    if (_references.length < BulkRoutes.maxHeld) {
+      _references[number] = Timer(BulkRoutes.heldTimeout, () {
+        _references.remove(number);
+        _discardUnreferenced();
+        _drain();
+      });
+    }
+    _discardUnreferenced();
+    _drain();
+  }
+
+  void _discardUnreferenced() {
+    for (final number in _opens.keys.toList()) {
+      if (number <= _highestReference && !_references.containsKey(number)) {
+        final (channel, timer) = _opens.remove(number)!;
+        timer.cancel();
+        bound?.exit(channel.connection);
+        unawaited(channel.close(genericStatus(StatusCode.cancelled)));
+      }
+    }
+  }
+
+  void _drain() {
+    while (_references.isNotEmpty) {
+      final number = _references.keys.first;
+      final open = _opens.remove(number);
+      if (open == null) return;
+      _references.remove(number)!.cancel();
+      final (channel, timer) = open;
+      timer.cancel();
+      bound?.exit(channel.connection);
+      forward(channel, number);
+    }
+  }
+
+  void clear() {
+    _ended = true;
+    for (final (channel, timer) in _opens.values) {
+      timer.cancel();
+      bound?.exit(channel.connection);
+      unawaited(channel.close(genericStatus(StatusCode.cancelled)));
+    }
+    _opens.clear();
+    for (final timer in _references.values) {
+      timer.cancel();
+    }
+    _references.clear();
+  }
 }
 
 /// Opens the twin of [bulk] (bulk number [number]) on [to]'s side, in
@@ -318,6 +440,7 @@ void _forward(
   Status Function(Status status)? rewrite,
   Set<_BulkTwin> twins = const {},
   bool bulk = false,
+  _BulkOrder? bulkOrder,
 }) {
   // Credit for what [from] receives goes back once [to] has taken it.
   from.manualCredit = true;
@@ -349,6 +472,7 @@ void _forward(
         return;
       }
       try {
+        bulkOrder?.observe(subframe);
         sending = to
             .send(subframe)
             .then(

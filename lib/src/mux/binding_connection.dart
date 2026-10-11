@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 import 'mux_channel.dart';
@@ -24,6 +25,7 @@ import 'mux_frame.dart';
 /// [UnsupportedError], and [localIdentity] is a plain field. A subclass
 /// overrides whatever it can answer better; everything else is its own to
 /// implement, its channels extending [MuxChannel].
+/// [hasOrderedChannels] defaults to false for independent channel streams.
 abstract class BindingConnection implements MuxConnection {
   /// For subclasses.
   BindingConnection();
@@ -42,6 +44,9 @@ abstract class BindingConnection implements MuxConnection {
 
   @override
   int get peerMaxChannels => 0;
+
+  @override
+  bool get hasOrderedChannels => false;
 
   @override
   int get bufferedBytes {

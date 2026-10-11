@@ -6,6 +6,7 @@ Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
   GPT-6 Astra <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 import 'dart:async';
@@ -46,6 +47,8 @@ typedef TransportConnector = Future<StreamChannel<Uint8List>> Function();
 /// a browser, say), for [ReconnectingClient.connections]: the connection,
 /// established as its initiator with [options] (the client's
 /// [ReconnectingClient.muxOptions]). Called once per connection attempt.
+/// Its [MuxConnection.incoming] must have no listener: the client owns
+/// dispatch and the connection's lifetime after it is returned.
 ///
 /// Failures count as those of a [TransportConnector] do; a connection it
 /// returns after the attempt was given up is closed.
@@ -789,6 +792,13 @@ class ReconnectingClient {
 
   /// [connection], established by the attempt, is the current one.
   void _onConnection(MuxConnection connection) {
+    try {
+      connection.incoming.listen(_onPeerChannel);
+    } on Object catch (e) {
+      connection.close().ignore();
+      _connectFailed(e);
+      return;
+    }
     final attempt = _attempt;
     _attempt = 0;
     _connection = connection;
@@ -797,7 +807,6 @@ class ReconnectingClient {
       _lifetimeTimer = null;
       _livedLong = true;
     });
-    connection.incoming.listen(_onPeerChannel);
     connection.done
         .then((status) => _onConnectionDone(connection, status))
         .ignore();

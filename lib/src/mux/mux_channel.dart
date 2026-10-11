@@ -7,6 +7,7 @@ Authors:
   Claude Fable 5.1 <noreply@anthropic.com>
   Claude Opus 5.5 <noreply@anthropic.com>
   GPT-6 Astra <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 import 'dart:async';
@@ -52,9 +53,10 @@ enum MuxPriority {
   /// Ordinary traffic: requests, responses, messages. Goes before bulk.
   normal,
 
-  /// A bulk transfer: its frames go after ordinary ones, but get a turn
-  /// after [MuxOptions.bulkZipper] ordinary frames while they wait, so
-  /// that sustained ordinary traffic cannot starve them. [MuxChannel.send]
+  /// A bulk transfer: its subframes go after ordinary ones. On the frame
+  /// mux they get a turn after [MuxOptions.bulkZipper] ordinary frames
+  /// while they wait, so sustained ordinary traffic cannot starve them.
+  /// [MuxChannel.send]
   /// splits a payload on such a channel into chunks of at most
   /// [MuxOptions.bulkChunkSize].
   bulk,
@@ -208,7 +210,6 @@ abstract class MuxChannel
   Stream<Uint8List> get stream;
 
   /// Whether [stream] has a listener: something reads the channel.
-  @internal
   bool get hasListener;
 
   /// Bytes of flow-control cost the peer may still send on the channel
@@ -273,17 +274,24 @@ abstract class MuxChannel
   /// for subframes not written yet.
   int get sendWindow;
 
-  /// The flow-control cost of sending a subframe of [length] bytes: what
+  /// The flow-control cost of sending a subframe of non-negative [length]
+  /// bytes: what
   /// [send] takes of [sendWindow] for it, and of the peer's window. The
   /// frame mux charges the length plus 16 (a DATA frame's cost); a binding
-  /// whose window counts payload bytes charges [length], or what its record
-  /// framing adds. A layer that bounds what it holds in the channel's terms
+  /// whose window counts records charges [length] plus its record overhead.
+  /// The cost must be positive even for an empty subframe: otherwise a
+  /// peer could make a stopped reader buffer unbounded empty records.
+  /// A layer that bounds what it holds in the channel's terms
   /// (a slot channel holding subframes while it reopens) counts with it.
   int sendCost(int length);
 
   /// The largest subframe the peer accepts, in bytes: what [send] takes
   /// on this channel in one piece, or a negative number when not even an
   /// empty one fits. Talk sends a larger message as a bulk payload.
+  /// An accepted ordinary subframe must be able to make progress under
+  /// the binding's credit-return policy when the receiver keeps consuming;
+  /// a record limit larger than the available receive capacity is not
+  /// by itself a safe value for this member.
   ///
   /// On the frame mux, half the peer's initial window less the 16 bytes
   /// of a DATA frame's cost (so that a peer returning credit in batches of
@@ -356,8 +364,8 @@ abstract class MuxChannel
   /// opened ahead of their messages, which an open sent at once could
   /// overtake while the message waits for credit or for the transport.
   /// The frame mux keeps the order on the wire, so the peer receives the
-  /// open before the subframes after the call, and the channels opened
-  /// after one channel in the order of their ids. A binding that carries
+  /// open before the subframes after the call, and opens after the same
+  /// parent in call order (channel ids may wrap). A binding that carries
   /// channels on separate streams cannot order streams: it opens the new
   /// stream once what this channel sent before the call is handed to the
   /// transport, and the peer may then receive the new channel before the
@@ -365,7 +373,11 @@ abstract class MuxChannel
   /// ended, or out of the order of the ids of the channels opened after
   /// this one. Talk waits for a bulk channel referenced before it arrived
   /// (`TalkOptions.bulkOpenTimeout`); its check that bulk numbers arrive
-  /// in increasing order holds on the frame mux only.
+  /// in increasing order applies only with
+  /// [MuxConnection.hasOrderedChannels]. A bulk open arriving before
+  /// its parent is held within a bounded backlog until the parent is
+  /// dispatched. Once the parent has ended it is refused: Talk's graceful
+  /// close waits for its outgoing bulk transfers before closing the parent.
   ///
   /// The new channel continues work the connection admitted already, so a
   /// GOAWAY, sent or received, does not refuse it, and a binding admits a
@@ -409,10 +421,8 @@ abstract class MuxChannel
   /// LIMITS, [MuxOptions.awaitPeerLimits]): until then [maxSubframeLength]
   /// is provisional. False, the default, for a binding that knows them
   /// from its handshake.
-  @internal
   bool get awaitingLimits => false;
 
   /// Completes once [awaitingLimits] is false, or the channel ended first.
-  @internal
   Future<void> get limitsKnown => Future<void>.value();
 }

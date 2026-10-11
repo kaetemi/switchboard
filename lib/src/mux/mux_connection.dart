@@ -7,6 +7,7 @@ Authors:
   Claude Fable 5.1 <noreply@anthropic.com>
   Claude Opus 5.5 <noreply@anthropic.com>
   GPT-6 Astra <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 import 'dart:async';
@@ -606,9 +607,18 @@ class MuxConnection {
   /// 0 when it states no limit (or has not stated one yet). A
   /// `Switchboard` opens another pooled connection to an endpoint once
   /// [openChannelCount] reached it. The frame mux: the channel limit of
-  /// the peer's LIMITS ([peerLimits]); a stream binding: the streams the
-  /// peer allows.
+  /// the peer's LIMITS ([peerLimits]). A stream binding translates its
+  /// stream capacity into this simultaneous channel limit, in both
+  /// directions; a cumulative transport stream-id limit is not this value.
   int get peerMaxChannels => _peerLimits?.maxChannels ?? 0;
+
+  /// Whether opens created by [MuxChannel.openAfter] on one parent are
+  /// received in call order, in order with that parent's subframes and
+  /// close. This does not order unrelated channels' opens.
+  /// True for the frame mux; false for independent streams. Talk uses
+  /// this guarantee to reject out-of-order bulk opens only where they
+  /// cannot be caused by the binding. Control ordering is separate.
+  bool get hasOrderedChannels => true;
 
   /// Number of channels not yet mutually closed, in both directions.
   /// Incoming channels rejected by the connection itself, and channels
@@ -618,7 +628,6 @@ class MuxConnection {
   /// The channel with [id] that is not mutually closed yet, if any: one
   /// of [channels]. Talk finds the parent a `_bulk` open payload names
   /// with it, which is why [MuxChannel.id] is the same at both ends.
-  @internal
   MuxChannel? channelWithId(int id) => _links[id]?.channel;
 
   /// The channels counted by [openChannelCount], as a snapshot.
@@ -626,11 +635,11 @@ class MuxConnection {
     for (final link in _links.values) link.channel,
   ];
 
-  /// Bytes received and not delivered to a stream's listener yet over all
-  /// channels, at their flow-control cost (a subframe's length plus 16),
-  /// plus the OPEN payloads held for the channels the peer opened until
-  /// they are closed and delivered (see [MuxOptions.maxOpenPayloadBytes]).
-  /// Compared against [MuxOptions.receiveHighWaterMarkBytes]. What a
+  /// Receive backlog at flow-control cost. The frame mux counts all
+  /// channels (including closed, undelivered ones) and held OPEN payloads
+  /// against [MuxOptions.receiveHighWaterMarkBytes]. [BindingConnection]
+  /// defaults to the sum of its current channels' buffered bytes; a
+  /// binding can include its additional receive bookkeeping. What a
   /// listener with [MuxChannel.manualCredit] holds is not counted (see
   /// there); each channel's window bounds it.
   int get bufferedBytes => _bufferedBytes;
@@ -657,9 +666,10 @@ class MuxConnection {
   /// the time of `package:clock`, until a valid `IDENT` with a renewed one
   /// arrives.
   ///
-  /// Frames the peer sends after an `IDENT` are handled only once that
-  /// `IDENT` is verified, so a channel opened right after it already sees
-  /// the identity it establishes.
+  /// On the frame mux, frames after an `IDENT` wait for verification,
+  /// so a channel opened right after it sees that identity. Independent
+  /// channel streams may arrive before control; dispatch then uses the
+  /// identity hold described in the binding contract above.
   PeerIdentity? get peerIdentity {
     final identity = _peerIdentity;
     return identity == null || identity.isExpired() ? null : identity;
@@ -689,7 +699,9 @@ class MuxConnection {
 
   /// Completes at the next valid `IDENT` of the peer, or when the
   /// connection ends. For holding channels until the peer identifies.
-  @internal
+  /// Never fails. The new identity is visible through [peerIdentity]
+  /// before completion. Each read subscribes to the next change, rather
+  /// than replaying a previous one; callers stop waiting when [done] ends.
   Future<void> get identityChanged =>
       (_identityEvent ??= Completer<void>()).future;
 
@@ -707,7 +719,7 @@ class MuxConnection {
   /// that it cannot pass this side's identification on to a third node.
   ///
   /// Completes once the peer has handled the `IDENT`: a PING sent right
-  /// after it has been answered. A peer handles the frames after an
+  /// after it has been answered. A peer handles control messages after an
   /// `IDENT` only once it has verified it, so the answer means it accepted
   /// the credential (or does not check identity); a peer that refuses it
   /// ends the connection with GOAWAY `UNAUTHENTICATED`. Calling again sends
@@ -1015,7 +1027,7 @@ class MuxConnection {
   ///
   /// The reason is shortened on the wire if needed, on a UTF-8 character
   /// boundary, so that the GOAWAY payload stays within 1024 bytes and the
-  /// frame fits the peer's announced frame limit.
+  /// frame fits the peer's announced frame limit (on the frame mux).
   /// The local-only `CONNECTION_LOST` code is sent as `UNAVAILABLE`, while
   /// the local end status retains the given code.
   ///

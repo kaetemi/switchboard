@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 // The binding seam: the node, Talk (bulk payloads, whenWritable), identity,
@@ -188,7 +189,7 @@ void main() {
 
   group('contract', () {
     test('the frame mux charges a subframe its length plus 16, a stream '
-        'binding its length', () {
+        'binding its length plus record overhead', () {
       final (a, b) = MemoryTransport.pair();
       final frame = MuxConnection(a, isInitiator: true, options: fast);
       final peer = MuxConnection(b, isInitiator: false, options: fast);
@@ -202,7 +203,7 @@ void main() {
       addTearDown(y.close);
       final streamed = x.open(Uint8List(0));
       expect(streamed, isNot(isA<FrameMuxChannel>()));
-      expect(streamed.sendCost(10), 10);
+      expect(streamed.sendCost(10), 11);
       // A binding's connection answers the frame mux's own diagnostics.
       expect(x.peerLimits, isNull);
       expect(x.heldOutputBytes, 0);
@@ -605,7 +606,7 @@ void main() {
       maxHeldBytes: 100,
     );
     expect(await first.done.timeout(limit), hasCode(StatusCode.moved));
-    // Two subframes of 40 bytes fit 100 bytes at the binding's cost (the
+    // Two subframes of 40 bytes fit 100 bytes at the binding's cost of 41 each (the
     // frame mux's, 56 each, would not); a third does not.
     final held = [slot.send(Uint8List(40)), slot.send(Uint8List(40))];
     await expectLater(

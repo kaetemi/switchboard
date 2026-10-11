@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 /// The wire structures of Talk bulk payloads (wiki page "Polyverse
@@ -21,6 +22,7 @@ import 'package:meta/meta.dart';
 import '../address/channel_address.dart';
 import '../bytes.dart';
 import '../mux/mux_channel.dart';
+import '../mux/mux_connection.dart';
 import '../name.dart';
 import '../status.dart';
 
@@ -205,6 +207,9 @@ abstract final class BulkRoutes {
     'bulk routes',
   );
   static final Expando<bool> _bulk = Expando<bool>('bulk channel');
+  static final Expando<_PendingParents> _pending = Expando<_PendingParents>(
+    'bulk opens before parents',
+  );
 
   /// The target registered for a parent, kept after the parent closed for
   /// [follow].
@@ -239,6 +244,7 @@ abstract final class BulkRoutes {
     }
     final route = _routeOf(parent);
     route.target = target;
+    _pending[parent.connection]?.dispatch(parent);
     final held = route.held;
     route.held = [];
     for (final (bulk, number, timer) in held) {
@@ -258,15 +264,22 @@ abstract final class BulkRoutes {
 
   /// Routes [bulk], a channel the peer opened with the open payload
   /// [open], to the target of its parent: closed `FAILED_PRECONDITION` when
-  /// no such channel is open on its connection (or it is itself a bulk
-  /// channel), or when something that is not a target reads it; held for
+  /// no such channel is open on an ordered connection (or it is itself a
+  /// bulk channel), or when something that is not a target reads it; held for
   /// a target to come while nothing reads it yet, at most [maxHeld], then
   /// `RESOURCE_EXHAUSTED`. Held channels are closed `CANCELLED` when the
-  /// parent closes.
+  /// parent closes. On independent streams, an unknown parent is held
+  /// for at most [heldTimeout], in a backlog of [maxHeld] per connection.
   static void route(MuxChannel bulk, TalkBulkOpen open) {
     markBulk(bulk);
     bulk.priority = MuxPriority.bulk;
     final parent = bulk.connection.channelWithId(open.parentId);
+    if (parent == null && !bulk.connection.hasOrderedChannels) {
+      (_pending[bulk.connection] ??= _PendingParents(
+        bulk.connection,
+      )).hold(bulk, open);
+      return;
+    }
     if (parent == null ||
         identical(parent, bulk) ||
         isBulk(parent) ||
@@ -355,6 +368,55 @@ abstract final class BulkRoutes {
       }),
     );
     return route;
+  }
+}
+
+/// Independent streams can deliver a bulk open before its parent's open.
+/// This is one bounded backlog per connection, not one per unknown id.
+class _PendingParents {
+  _PendingParents(MuxConnection connection) {
+    unawaited(connection.done.then((_) => _clear()));
+  }
+
+  final Map<MuxChannel, (TalkBulkOpen, Timer)> _held = {};
+
+  void hold(MuxChannel bulk, TalkBulkOpen open) {
+    if (_held.length >= BulkRoutes.maxHeld) {
+      BulkRoutes._refuse(
+        bulk,
+        Status.of(
+          StatusCode.resourceExhausted,
+          'too many unknown bulk parents',
+        ),
+      );
+      return;
+    }
+    final timer = Timer(BulkRoutes.heldTimeout, () {
+      _held.remove(bulk);
+      BulkRoutes._refuse(
+        bulk,
+        Status.of(StatusCode.failedPrecondition, 'bulk parent did not arrive'),
+      );
+    });
+    _held[bulk] = (open, timer);
+  }
+
+  void dispatch(MuxChannel parent) {
+    for (final entry in _held.entries.toList()) {
+      final (open, timer) = entry.value;
+      if (open.parentId == parent.id) {
+        _held.remove(entry.key);
+        timer.cancel();
+        BulkRoutes.route(entry.key, open);
+      }
+    }
+  }
+
+  void _clear() {
+    for (final (_, timer) in _held.values) {
+      timer.cancel();
+    }
+    _held.clear();
   }
 }
 

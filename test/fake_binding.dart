@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 // A fake binding of the connection contract, for the tests of the seam:
@@ -15,7 +16,8 @@ Authors:
 // GOAWAY, NONCE, IDENT) go on a control "stream" of their own, which may
 // be slower than the channels ([FakeConnection.pair]'s `controlDelay`), as
 // the streams of a QUIC connection are not ordered with each other. Flow
-// control counts payload bytes ([MuxChannel.sendCost] is the length), the
+// control counts payload bytes plus one byte per record (empty records
+// must be bounded too), the
 // windows are the [MuxOptions.initialWindow] of each side, known to the
 // other from the start (as QUIC's transport parameters are), and channel
 // ids are carried in the open record as the binding contract has it: the
@@ -30,7 +32,6 @@ import 'dart:collection';
 import 'dart:convert';
 import 'dart:typed_data';
 
-import 'package:switchboard/src/mux/mux_protocol.dart';
 import 'package:switchboard/switchboard.dart';
 
 /// One record on the control stream.
@@ -66,10 +67,17 @@ class _Closed extends _Control {}
 
 /// A connection of the fake binding. Make one with [FakeConnection.pair].
 class FakeConnection extends BindingConnection {
-  FakeConnection._(this.isInitiator, this.options, this.controlDelay)
-    : _nextId = isInitiator ? 2 : 3 {
+  FakeConnection._(
+    this.isInitiator,
+    this.options,
+    this.controlDelay,
+    this.channelDelay,
+  ) : _nextId = isInitiator ? 2 : 3 {
     _incoming = StreamController<MuxChannel>(
-      onCancel: () => _incomingCancelled = true,
+      sync: true,
+      onListen: _scheduleIncoming,
+      onResume: _scheduleIncoming,
+      onCancel: _cancelIncoming,
     );
   }
 
@@ -79,9 +87,10 @@ class FakeConnection extends BindingConnection {
     MuxOptions initiator = const MuxOptions(),
     MuxOptions acceptor = const MuxOptions(),
     Duration controlDelay = Duration.zero,
+    Duration Function(int id)? channelDelay,
   }) {
-    final a = FakeConnection._(true, initiator, controlDelay);
-    final b = FakeConnection._(false, acceptor, controlDelay);
+    final a = FakeConnection._(true, initiator, controlDelay, channelDelay);
+    final b = FakeConnection._(false, acceptor, controlDelay, channelDelay);
     a._peer = b;
     b._peer = a;
     return (a, b);
@@ -96,9 +105,17 @@ class FakeConnection extends BindingConnection {
   /// How much later than channel records control records arrive.
   final Duration controlDelay;
 
+  /// A fixed delay per channel stream, in both directions. Different
+  /// channels may overtake one another; records of one channel cannot.
+  final Duration Function(int id)? channelDelay;
+
   late final FakeConnection _peer;
   late final StreamController<MuxChannel> _incoming;
   final Map<int, FakeChannel> _channels = {};
+  final Queue<FakeChannel> _undelivered = Queue<FakeChannel>();
+  final Set<FakeChannel> _payloads = {};
+  int _openPayloadBytes = 0;
+  bool _incomingScheduled = false;
   final Completer<Status> _done = Completer<Status>();
   final Completer<Status> _peerGoAwayStatus = Completer<Status>();
   final List<(Uint8List, Completer<Duration>, Stopwatch)> _pings = [];
@@ -132,11 +149,11 @@ class FakeConnection extends BindingConnection {
 
   // The wire ----------------------------------------------------------------
 
-  /// Runs [deliver] on the peer's side after the records posted before it
-  /// on the channel streams, unless the peer has closed by then.
-  void _postData(void Function() deliver) {
+  /// Runs [deliver] on the peer's side, in order with earlier records on
+  /// channel [id], unless the peer has closed by then.
+  void _postData(int id, void Function() deliver) {
     final peer = _peer;
-    Timer.run(() {
+    Timer(channelDelay?.call(id) ?? Duration.zero, () {
       if (!peer._closing) {
         deliver();
       }
@@ -178,6 +195,9 @@ class FakeConnection extends BindingConnection {
 
   @override
   int get openChannelCount => _channels.length;
+
+  @override
+  int get openPayloadBytes => _openPayloadBytes;
 
   @override
   MuxChannel? channelWithId(int id) => _channels[id];
@@ -225,6 +245,17 @@ class FakeConnection extends BindingConnection {
         'peer accepts at most $max channels',
       );
     }
+    // The shared id vocabulary reserves these values, independent of the
+    // binding's encoding. Never wrap or reuse an id on this binding.
+    if (_nextId == 0xFFFF || _nextId == 0xFFFF00000000) {
+      _nextId += 2;
+    }
+    if (_nextId >= 0xFFFFFFFFFFFF) {
+      throw SwitchboardException.of(
+        StatusCode.resourceExhausted,
+        'ids used up',
+      );
+    }
     final id = _nextId;
     _nextId += 2;
     final channel = FakeChannel._(
@@ -247,16 +278,24 @@ class FakeConnection extends BindingConnection {
     } else if (_incomingCancelled) {
       rejection = Status.of(StatusCode.unavailable, 'not accepting channels');
     } else if (options.maxChannels > 0 &&
-        _channels.length >= options.maxChannels) {
+        (_channels.length >= options.maxChannels ||
+            _undelivered.length >= options.maxChannels)) {
       rejection = Status.of(
         StatusCode.resourceExhausted,
         'at most ${options.maxChannels} channels',
+      );
+    } else if (options.maxOpenPayloadBytes > 0 &&
+        _openPayloadBytes + opener.openPayload.length >
+            options.maxOpenPayloadBytes) {
+      rejection = Status.of(
+        StatusCode.resourceExhausted,
+        'open payload budget',
       );
     }
     if (rejection != null) {
       final status = rejection;
       _count('close');
-      _postData(() => opener._onClose(status));
+      _postData(opener.id, () => opener._onClose(status));
       return;
     }
     final channel = FakeChannel._(
@@ -270,7 +309,44 @@ class FakeConnection extends BindingConnection {
     channel._peerChannel = opener;
     opener._peerChannel = channel;
     _channels[channel.id] = channel;
-    _incoming.add(channel);
+    _payloads.add(channel);
+    _openPayloadBytes += channel.openPayload.length;
+    _undelivered.add(channel);
+    _scheduleIncoming();
+  }
+
+  void _scheduleIncoming() {
+    if (_incomingScheduled) return;
+    _incomingScheduled = true;
+    scheduleMicrotask(() {
+      _incomingScheduled = false;
+      while (_undelivered.isNotEmpty &&
+          _incoming.hasListener &&
+          !_incoming.isPaused) {
+        final channel = _undelivered.removeFirst();
+        if (channel.state == MuxChannelState.closed) _releasePayload(channel);
+        _incoming.add(channel);
+      }
+      if (_closing && _undelivered.isEmpty && !_incoming.isClosed) {
+        unawaited(_incoming.close());
+      }
+    });
+  }
+
+  void _cancelIncoming() {
+    _incomingCancelled = true;
+    final pending = List.of(_undelivered);
+    _undelivered.clear();
+    for (final channel in pending) {
+      _releasePayload(channel);
+      unawaited(channel.close(Status.of(StatusCode.unavailable)));
+    }
+  }
+
+  void _releasePayload(FakeChannel channel) {
+    if (_payloads.remove(channel)) {
+      _openPayloadBytes -= channel.openPayload.length;
+    }
   }
 
   /// Whether [openPayload] opens a `_bulk` channel for an open channel of
@@ -291,6 +367,7 @@ class FakeConnection extends BindingConnection {
   void _release(FakeChannel channel) {
     if (identical(_channels[channel.id], channel)) {
       _channels.remove(channel.id);
+      if (!_undelivered.contains(channel)) _releasePayload(channel);
       scheduleMicrotask(_checkIdle);
     }
   }
@@ -311,6 +388,9 @@ class FakeConnection extends BindingConnection {
 
   @override
   Future<Duration> ping([Uint8List? payload]) {
+    if (payload != null && payload.length > 125) {
+      throw ArgumentError.value(payload.length, 'payload', 'at most 125 bytes');
+    }
     if (_closing) {
       return Future.error(
         SwitchboardException.of(
@@ -323,6 +403,14 @@ class FakeConnection extends BindingConnection {
         ? (ByteData(4)..setUint32(0, _pingCounter++)).buffer.asUint8List()
         : Uint8List.fromList(payload);
     final completer = Completer<Duration>();
+    if (_pings.length >= MuxConnection.maxPendingPings) {
+      _pings
+          .removeAt(0)
+          .$2
+          .completeError(
+            SwitchboardException.of(StatusCode.deadlineExceeded, 'no PONG'),
+          );
+    }
     _pings.add((bytes, completer, Stopwatch()..start()));
     _postControl(_Ping(bytes));
     return completer.future;
@@ -337,7 +425,7 @@ class FakeConnection extends BindingConnection {
     if (!_goAwaySent) {
       _goAwaySent = true;
       _ownGoAway = status;
-      _postControl(_GoAway(statusFromWire(fitStatus(status, 0, 0))));
+      _postControl(_GoAway(statusFromWire(statusForWire(status))));
     }
     return _goAwayWait();
   }
@@ -376,6 +464,7 @@ class FakeConnection extends BindingConnection {
     final lost = channelStatus ?? status;
     for (final channel in List.of(_channels.values)) {
       channel._connectionLost(lost);
+      if (!_undelivered.contains(channel)) _releasePayload(channel);
     }
     _channels.clear();
     for (final (_, completer, _) in _pings) {
@@ -392,7 +481,7 @@ class FakeConnection extends BindingConnection {
     if (idle != null && !idle.isCompleted) {
       idle.complete();
     }
-    unawaited(_incoming.close());
+    _scheduleIncoming();
     if (!_done.isCompleted) {
       _done.complete(status);
     }
@@ -515,6 +604,10 @@ class FakeConnection extends BindingConnection {
       return;
     }
     if (_verifying) {
+      if (_heldControl.length >= 1024) {
+        _fail(Status.of(StatusCode.resourceExhausted, 'held control budget'));
+        return;
+      }
       _heldControl.add(record);
       return;
     }
@@ -566,6 +659,13 @@ class FakeConnection extends BindingConnection {
       _fail(Status.of(StatusCode.protocolError, 'IDENT before the nonces'));
       return;
     }
+    final MuxIdent ident;
+    try {
+      ident = MuxIdent.decode(payload);
+    } on ProtocolException catch (e) {
+      _fail(e.status);
+      return;
+    }
     final verifier = options.identityVerifier;
     if (verifier == null) {
       return;
@@ -574,7 +674,7 @@ class FakeConnection extends BindingConnection {
     // channels do not, as with QUIC's streams.
     _verifying = true;
     verifyIdent(
-      MuxIdent.decode(payload),
+      ident,
       verifier: verifier,
       senderNonce: peerNonce,
       receiverNonce: localNonce,
@@ -662,6 +762,7 @@ class FakeChannel extends MuxChannel {
   // openAfter) what it sends waits in [_preOpen].
   bool _opened = false;
   final List<void Function()> _preOpen = [];
+  final Set<FakeChannel> _childrenWaitingOpen = {};
 
   // Sending.
   final int _initialSendWindow;
@@ -734,11 +835,12 @@ class FakeChannel extends MuxChannel {
     if (_released) {
       return;
     }
-    if (bytes > _held) {
-      throw StateError('$bytes bytes reported consumed, $_held held');
+    final cost = bytes + subframes;
+    if (cost > _held) {
+      throw StateError('$cost credit reported consumed, $_held held');
     }
-    _held -= bytes;
-    _consume(bytes);
+    _held -= cost;
+    _consume(cost);
   }
 
   @override
@@ -748,6 +850,9 @@ class FakeChannel extends MuxChannel {
     }
     if (!_mayReturnCredit) {
       return;
+    }
+    if (_creditWindow + bytes > 0xFFFFFFFF) {
+      throw ArgumentError.value(bytes, 'bytes', 'window exceeds binding limit');
     }
     _creditWindow += bytes;
     final credit = bytes + _unreturned;
@@ -765,12 +870,14 @@ class FakeChannel extends MuxChannel {
   @override
   int get sendWindow => _sendWindow;
 
-  /// A stream binding counts payload bytes.
+  /// One byte of record overhead bounds empty subframes too.
   @override
-  int sendCost(int length) => length;
+  int sendCost(int length) => length + 1;
 
   @override
-  int get maxSubframeLength => _initialSendWindow ~/ 2;
+  int get maxSubframeLength => _initialSendWindow < 2
+      ? _initialSendWindow - 1
+      : _initialSendWindow ~/ 2 - 1;
 
   @override
   Future<void> send(Uint8List subframe) {
@@ -781,6 +888,13 @@ class FakeChannel extends MuxChannel {
       );
     }
     final split = _priority == MuxPriority.bulk && subframe.isNotEmpty;
+    if (split &&
+        (_initialSendWindow < 2 || connection.options.bulkChunkSize < 1)) {
+      throw SwitchboardException.of(
+        StatusCode.frameTooLarge,
+        'no room for bulk',
+      );
+    }
     if (!split && subframe.length > maxSubframeLength) {
       throw SwitchboardException.of(
         StatusCode.frameTooLarge,
@@ -847,7 +961,7 @@ class FakeChannel extends MuxChannel {
     }
     final child = connection._openLocal(openPayload, continuation: true);
     if (_sends.isEmpty) {
-      child._postOpen();
+      _postChild(child);
     } else {
       _sends.add(_Send.open(child));
     }
@@ -884,7 +998,7 @@ class FakeChannel extends MuxChannel {
       return;
     }
     connection._count(kind);
-    connection._postData(() {
+    connection._postData(id, () {
       final peer = _peerChannel;
       if (peer != null) {
         deliver(peer);
@@ -896,7 +1010,7 @@ class FakeChannel extends MuxChannel {
   void _postOpen() {
     _opened = true;
     connection._count('open');
-    connection._postData(() => connection._peer._onOpen(this));
+    connection._postData(id, () => connection._peer._onOpen(this));
     final waiting = List.of(_preOpen);
     _preOpen.clear();
     for (final post in waiting) {
@@ -904,6 +1018,18 @@ class FakeChannel extends MuxChannel {
     }
     if (_state == MuxChannelState.halfClosedLocal) {
       _startConfirmTimer();
+    }
+  }
+
+  void _postChild(FakeChannel child) {
+    if (_opened) {
+      child._postOpen();
+    } else {
+      _childrenWaitingOpen.add(child);
+      _preOpen.add(() {
+        _childrenWaitingOpen.remove(child);
+        child._postOpen();
+      });
     }
   }
 
@@ -918,7 +1044,7 @@ class FakeChannel extends MuxChannel {
         final child = head.opens;
         if (child != null) {
           _sends.removeFirst();
-          child._postOpen();
+          _postChild(child);
           head.completer.complete();
           continue;
         }
@@ -926,29 +1052,29 @@ class FakeChannel extends MuxChannel {
           final floor = maxSubframeLength < 1 ? 1 : maxSubframeLength;
           while (head.offset < head.data.length) {
             final rest = head.data.length - head.offset;
-            if (_sendWindow < (rest < floor ? rest : floor)) {
+            if (_sendWindow < sendCost(rest < floor ? rest : floor)) {
               break;
             }
             var n = connection.options.bulkChunkSize;
             if (rest < n) {
               n = rest;
             }
-            if (_sendWindow < n) {
-              n = _sendWindow;
+            if (_sendWindow - 1 < n) {
+              n = _sendWindow - 1;
             }
             final start = head.offset;
             head.offset += n;
-            _sendWindow -= n;
+            _sendWindow -= sendCost(n);
             _postSubframe(Uint8List.sublistView(head.data, start, start + n));
           }
           if (head.offset < head.data.length) {
             break;
           }
         } else {
-          if (head.data.length > _sendWindow) {
+          if (sendCost(head.data.length) > _sendWindow) {
             break;
           }
-          _sendWindow -= head.data.length;
+          _sendWindow -= sendCost(head.data.length);
           _postSubframe(head.data);
         }
         _sends.removeFirst();
@@ -970,7 +1096,7 @@ class FakeChannel extends MuxChannel {
 
   void _postClose(Status status) {
     _closeQueued = true;
-    final wire = fitStatus(status, 0, 0);
+    final wire = statusForWire(status);
     _toPeer('close', (peer) => peer._onClose(statusFromWire(wire)));
   }
 
@@ -1022,16 +1148,17 @@ class FakeChannel extends MuxChannel {
     if (_closeReceived || _released) {
       return;
     }
-    _receiveWindow -= data.length;
+    final cost = sendCost(data.length);
+    _receiveWindow -= cost;
     if (_receiveWindow < 0) {
       throw StateError('channel $id: the peer sent beyond its window');
     }
     if (_discarding || _ended) {
-      _consume(data.length);
+      _consume(cost);
       return;
     }
     _queue.add(data);
-    _queuedBytes += data.length;
+    _queuedBytes += cost;
     _scheduleDrain();
   }
 
@@ -1103,11 +1230,12 @@ class FakeChannel extends MuxChannel {
     _drainScheduled = false;
     while (_queue.isNotEmpty && _incoming.hasListener && !_incoming.isPaused) {
       final data = _queue.removeFirst();
-      _queuedBytes -= data.length;
+      final cost = sendCost(data.length);
+      _queuedBytes -= cost;
       if (_manualCredit && !_released) {
-        _held += data.length;
+        _held += cost;
       } else {
-        _unreturned += data.length;
+        _unreturned += cost;
       }
       _incoming.add(data);
     }
@@ -1135,6 +1263,15 @@ class FakeChannel extends MuxChannel {
     _pendingClose = null;
     _failSends();
     _preOpen.clear();
+    for (final child in _childrenWaitingOpen) {
+      child
+        .._noteStatus(
+          Status.of(StatusCode.cancelled, 'the open never went out'),
+        )
+        .._complete();
+      connection._release(child);
+    }
+    _childrenWaitingOpen.clear();
     _released = true;
     _held = 0;
     _ended = true;

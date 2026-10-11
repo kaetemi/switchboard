@@ -6,6 +6,7 @@ Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
   GPT-6 Astra <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 import 'dart:async';
@@ -444,6 +445,12 @@ class TalkChannel {
   final Map<int, _Awaited> _bulkAwaited = {};
   final Set<_BulkIn> _bulkIns = {};
   int _bulkInHighest = 0;
+  // References travel on one ordered parent stream even when bulk opens
+  // travel on independent streams. This watermark retires numbers without
+  // keeping a lifetime-sized set of completed transfers.
+  int _bulkReferenceHighest = 0;
+
+  bool get _orderedBulk => _mux?.connection.hasOrderedChannels ?? true;
 
   /// The reassembly budget in use ([TalkOptions.reassemblyBudget]): what
   /// the payloads admitted for a listener are charged, until taken.
@@ -1699,13 +1706,20 @@ class TalkChannel {
       b.abandon();
       return;
     }
-    if (number <= _bulkInHighest) {
+    final reused = _orderedBulk
+        ? number <= _bulkInHighest
+        : _bulkUnclaimed.containsKey(number) ||
+              (number <= _bulkReferenceHighest &&
+                  !_bulkAwaited.containsKey(number));
+    if (reused) {
       b.close(Status.of(StatusCode.protocolError, 'bulk number reused'));
       b.abandon();
       _protocolError('bulk number $number reused');
       return;
     }
-    _bulkInHighest = number;
+    if (_orderedBulk) {
+      _bulkInHighest = number;
+    }
     final awaited = _bulkAwaited.remove(number);
     if (awaited != null) {
       awaited.timer.cancel();
@@ -1766,6 +1780,9 @@ class TalkChannel {
       return true;
     }
     final number = reference.number;
+    if (!_acceptBulkReference(number)) {
+      return false;
+    }
     final b = _bulkUnclaimed.remove(number);
     if (b != null) {
       _queueForBudget(message);
@@ -1851,6 +1868,9 @@ class TalkChannel {
       return;
     }
     final number = frame.bulkReference.number;
+    if (!_acceptBulkReference(number)) {
+      return;
+    }
     final b = _bulkUnclaimed.remove(number);
     if (b != null) {
       b.abandon();
@@ -1864,6 +1884,21 @@ class TalkChannel {
       return;
     }
     _awaitBulk(number, null);
+  }
+
+  /// On independent streams only the references, all on the parent,
+  /// arrive in number order. An awaited open can still arrive below this
+  /// watermark; an already matched number cannot be used a second time.
+  bool _acceptBulkReference(int number) {
+    if (_orderedBulk) {
+      return true;
+    }
+    if (number <= _bulkReferenceHighest) {
+      _protocolError('bulk reference $number reused or out of order');
+      return false;
+    }
+    _bulkReferenceHighest = number;
+    return true;
   }
 
   /// Dispatch may lag, but ignored responses must not buy unbounded

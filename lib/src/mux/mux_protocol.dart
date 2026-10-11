@@ -6,6 +6,7 @@ Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
   GPT-6 Astra <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 /// What every binding of a connection carries identically, whatever its
@@ -33,13 +34,11 @@ import '../status.dart';
 /// `GOAWAY`, `NONCE` and `IDENT`: 1024 bytes, and the bound this
 /// implementation keeps every CLOSE and GOAWAY status payload within.
 /// The frame mux's `MuxControlMessage.maxControlPayload`.
-@internal
 const int maxControlPayloadLength = 1024;
 
 /// Throws [ArgumentError] if [status] carries an application code (256
 /// and above), which must not be used in a channel CLOSE or a GOAWAY,
 /// whichever binding carries them.
-@internal
 void checkMuxStatus(Status status) {
   if (status.code < 0 || status.isApplicationCode) {
     throw ArgumentError.value(
@@ -58,7 +57,6 @@ void checkMuxStatus(Status status) {
 /// bytes) are kept whole; when they do not fit, everything
 /// after the code is dropped. Returns [status] itself when it fits; drops
 /// the reason entirely when [maxPayload] leaves no room for it.
-@internal
 Status truncateStatus(Status status, int maxPayload) {
   if (status.reason.isEmpty) {
     return status;
@@ -115,18 +113,25 @@ Status fitStatus(Status status, int overhead, int peerMaxFrameSize) {
   return truncateStatus(status, max);
 }
 
+/// A CLOSE or GOAWAY status for a binding's wire: application codes are
+/// refused, `CONNECTION_LOST` becomes `UNAVAILABLE`, and the payload is
+/// shortened to [maxControlPayloadLength] bytes without changing fixed
+/// fields or splitting a UTF-8 character. [status] itself is not mutated.
+Status statusForWire(Status status) {
+  checkMuxStatus(status);
+  return fitStatus(status, 0, 0);
+}
+
 /// Maps a status received in CLOSE or GOAWAY for local use: application
 /// codes (256 and above), which the peer must not send there, become
 /// [StatusCode.unknown] with the original code kept in the reason, so the
 /// status can be relayed in a CLOSE of our own.
-@internal
 Status statusFromWire(Status status) => status.isApplicationCode
     ? Status.of(StatusCode.unknown, status.toString())
     : status;
 
 /// Decodes a status payload carried by CLOSE or GOAWAY, mapping malformed
 /// payloads to [ProtocolException]. [what] names the carrier for the error.
-@internal
 Status decodeStatusPayload(Uint8List payload, String what) {
   try {
     return Status.decode(payload);
@@ -372,7 +377,6 @@ Future<PeerIdentity> verifyIdent(
 /// [localIdentity], or null when it is not: a receiver other than
 /// [localIdentity], or none while [requireNamedIdent]. The first check of
 /// [verifyIdent], which a binding may make before anything asynchronous.
-@internal
 String? identReceiverProblem(
   Uint8List receiver, {
   String? localIdentity,

@@ -7,6 +7,7 @@ Authors:
   Claude Fable 5.1 <noreply@anthropic.com>
   Claude Opus 5.5 <noreply@anthropic.com>
   GPT-6 Astra <noreply@anthropic.com>
+  GPT-6 Astra <noreply@openai.com>
 */
 
 import 'dart:async';
@@ -177,20 +178,17 @@ class FrameMuxChannel extends MuxChannel {
 
   /// Whether [stream] has a listener: something reads the channel.
   @override
-  @internal
   bool get hasListener => _incoming.hasListener;
 
   /// Whether DATA waits for the peer's LIMITS (see [sendWindow]): until
   /// then [maxSubframeLength] reflects the 64 KiB assumed without one.
   @override
-  @internal
   bool get awaitingLimits =>
       _awaitingLimits && _state != MuxChannelState.closed;
 
   /// Completes once the wait for the peer's LIMITS ended, or the channel
   /// ended first.
   @override
-  @internal
   Future<void> get limitsKnown {
     if (!awaitingLimits) {
       return Future<void>.value();
