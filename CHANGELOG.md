@@ -320,6 +320,26 @@ The protocol specification lives in the project wiki (section
   mux in increasing number and holds a graceful close for them. No wire
   change, and nothing changes over the frame mux; the built-in `ws`,
   `wss`, `tcp` and `mem` are dialled and pooled as before.
+- Exporter-bound `IDENT` proof for stream bindings (page "Polyverse
+  Switchboard QUIC and WebTransport Binding", section "Identity"):
+  `MuxIdent.proofMessage` and `verifyIdent` take an optional 32-byte
+  `exporter`, with which the proof signs `"SWBIDTLS" ‖ sender nonce ‖
+  receiver nonce ‖ exporter ‖ len8 intent ‖ intent ‖ len8 receiver ‖
+  receiver` instead of the `"SWBIDENT"` form (`MuxIdent.exporterProofLabel`,
+  `MuxIdent.exporterLength`); a proof of one form never verifies as the
+  other. The frame mux never passes one: no wire change, and nothing
+  changes over the frame mux. Test vector X of the binding page.
+  `secureRandomBytes` is exported from `core.dart`, so that a binding in
+  another package draws its `NONCE` as the frame mux does (on the web
+  through `crypto.getRandomValues`, which works under Node.js too, in
+  calls of at most 65536 bytes, the Web Crypto quota per call).
+  `BindingConnection` drain holds: a parent that Talk keeps waiting for
+  the bulk channels referenced before its graceful close
+  (`BulkRoutes.linger`, at most 16 per connection) is held for the
+  binding (`retainForDrain`, `hasDrainHolds`, `retainedForDrain`,
+  `drainStateChanged`), which counts it in its idle check after a
+  `GOAWAY` and admits its late `_bulk` channels after its own `GOAWAY`.
+  Nothing changes over the frame mux, whose channels are ordered.
 - Naming and sharding fixes: the `RESUME` of a rolled-back migration is
   sent again until the old owner answers it (the `ASSIGN` backoff
   intervals); after `NamingService.resumeAttempts` (5) failures in a row

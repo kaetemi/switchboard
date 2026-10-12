@@ -21,6 +21,7 @@ import 'package:meta/meta.dart';
 
 import '../address/channel_address.dart';
 import '../bytes.dart';
+import '../mux/binding_connection.dart';
 import '../mux/mux_channel.dart';
 import '../mux/mux_connection.dart';
 import '../name.dart';
@@ -280,9 +281,13 @@ abstract final class BulkRoutes {
     if (connection.hasOrderedChannels) {
       return false;
     }
-    return (_ended[connection] ??= _EndedParents(
+    final added = (_ended[connection] ??= _EndedParents(
       connection,
     )).add(parent.id, target, until);
+    if (added && connection is BindingConnection) {
+      connection.retainForDrain(parent.id, until);
+    }
+    return added;
   }
 
   /// Routes [bulk], a channel the peer opened with the open payload

@@ -32,6 +32,7 @@ export 'src/identity/credential_issuer.dart' show CredentialIssuer;
 export 'src/identity/credential_verifier.dart';
 export 'src/identity/holder_key.dart';
 export 'src/identity/peer_identity.dart';
+export 'src/identity/secure_random.dart' show secureRandomBytes;
 export 'src/mux/binding_connection.dart';
 export 'src/mux/frame_mux_channel.dart' show FrameMuxChannel;
 export 'src/mux/mux_channel.dart' show MuxChannel, MuxChannelState, MuxPriority;

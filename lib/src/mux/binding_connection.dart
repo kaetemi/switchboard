@@ -8,6 +8,8 @@ Authors:
   GPT-6 Astra <noreply@openai.com>
 */
 
+import 'dart:async';
+
 import 'mux_channel.dart';
 import 'mux_connection.dart';
 import 'mux_frame.dart';
@@ -29,6 +31,35 @@ import 'mux_frame.dart';
 abstract class BindingConnection implements MuxConnection {
   /// For subclasses.
   BindingConnection();
+
+  // Only independent-stream bindings need to keep ended parents alive
+  // while their application still waits for already referenced streams.
+  final Map<int, Future<void>> _drainHolds = {};
+
+  /// Whether admitted work still waits for streams after its parent ended.
+  bool get hasDrainHolds => _drainHolds.isNotEmpty;
+
+  /// Whether [id] is an ended parent whose reader still waits for streams.
+  bool retainedForDrain(int id) => _drainHolds.containsKey(id);
+
+  /// Keeps admitted work on [parentId] alive until [until] settles. Talk
+  /// calls this only for its bounded backlog of lingering parents. A
+  /// binding includes these holds in its idle check and admits their
+  /// continuation streams after GOAWAY. Its grace timeout still applies.
+  void retainForDrain(int parentId, Future<void> until) {
+    _drainHolds[parentId] = until;
+    until.whenComplete(() {
+      if (identical(_drainHolds[parentId], until)) {
+        _drainHolds.remove(parentId);
+        drainStateChanged();
+      }
+    }).ignore();
+    drainStateChanged();
+  }
+
+  /// Called when a drain hold is added or released. A binding schedules
+  /// its idle check here, after channel listeners have handled their end.
+  void drainStateChanged() {}
 
   @override
   String? localIdentity;
