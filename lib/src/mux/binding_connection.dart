@@ -46,6 +46,11 @@ abstract class BindingConnection implements MuxConnection {
   /// calls this only for its bounded backlog of lingering parents. A
   /// binding includes these holds in its idle check and admits their
   /// continuation streams after GOAWAY. Its grace timeout still applies.
+  ///
+  /// Part of the contract between Talk and a binding, not an application
+  /// call: it is public so that Talk, in another library of this package,
+  /// and a binding's tests, standing in for Talk, can make it. An
+  /// application that holds a connection open waits on its channels.
   void retainForDrain(int parentId, Future<void> until) {
     _drainHolds[parentId] = until;
     until.whenComplete(() {

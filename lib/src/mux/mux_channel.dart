@@ -271,6 +271,14 @@ abstract class MuxChannel
   /// Bytes of flow-control cost this side may still send on the channel
   /// before the peer returns credit, leaving out what [send] has reserved
   /// for subframes not written yet.
+  ///
+  /// Over the frame mux this is exact: the channel keeps the window. A
+  /// binding whose streams are flow-controlled by the stack (QUIC) cannot
+  /// see the stack's window and answers an estimate: room for one largest
+  /// subframe while [isWritable], else 0. Callers decide whether to produce
+  /// a subframe by [isWritable] and [whenWritable], and follow one by the
+  /// future of [send]; the window is a diagnostic, and a count to rely on
+  /// only over the mux.
   int get sendWindow;
 
   /// The flow-control cost of sending a subframe of non-negative [length]
