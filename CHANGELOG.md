@@ -331,7 +331,15 @@ The protocol specification lives in the project wiki (section
   changes over the frame mux. Test vector X of the binding page.
   `secureRandomBytes` is exported from `core.dart`, so that a binding in
   another package draws its `NONCE` as the frame mux does (on the web
-  through `crypto.getRandomValues`, which works under Node.js too).
+  through `crypto.getRandomValues`, which works under Node.js too, in
+  calls of at most 65536 bytes, the Web Crypto quota per call).
+  `BindingConnection` drain holds: a parent that Talk keeps waiting for
+  the bulk channels referenced before its graceful close
+  (`BulkRoutes.linger`, at most 16 per connection) is held for the
+  binding (`retainForDrain`, `hasDrainHolds`, `retainedForDrain`,
+  `drainStateChanged`), which counts it in its idle check after a
+  `GOAWAY` and admits its late `_bulk` channels after its own `GOAWAY`.
+  Nothing changes over the frame mux, whose channels are ordered.
 - Naming and sharding fixes: the `RESUME` of a rolled-back migration is
   sent again until the old owner answers it (the `ASSIGN` backoff
   intervals); after `NamingService.resumeAttempts` (5) failures in a row
