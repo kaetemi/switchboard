@@ -9,6 +9,7 @@ Authors:
 
 import '../status.dart';
 import 'talk_channel.dart';
+import 'talk_frame.dart';
 import 'talk_message.dart';
 import 'talk_request.dart';
 
@@ -50,7 +51,42 @@ abstract class TalkStream {
   /// answered through its reply API. If the listener throws synchronously
   /// while handling such an item before replying, the error is logged and
   /// the item is answered with `ABORT INTERNAL` and marked cancelled.
+  ///
+  /// With a finite item window ([window]) items keep arriving only as the
+  /// application grants them ([grant]): once the window is exhausted, the
+  /// responder sends nothing more until a grant, whatever this stream's
+  /// subscription does. The final response is not counted: it may arrive
+  /// while items are still held unprocessed, a page that exactly fills
+  /// its window say, and no grant is owed afterwards.
   Stream<TalkMessage> get items;
+
+  /// The item window as this side sees it (wiki page "Polyverse
+  /// Switchboard Talk", "Item windows"): how many more items the responder
+  /// may send, the window the request opened with and every [grant] since,
+  /// less the items that arrived (an item that is itself a request, or
+  /// carries a bulk payload, counts as one). Null when the window is
+  /// unlimited.
+  int? get window;
+
+  /// Grants the responder [items] more items of the window: sends a credit
+  /// (an `EXTEND` carrying this request's id). Grant what the application
+  /// has consumed (for a durable consumer, committed), coalescing several
+  /// items into one grant; nothing is granted on its behalf, not even when
+  /// items are handed to the listener of [items].
+  ///
+  /// While the window is exhausted the requester timeout does not run
+  /// ([deadline] is null); a grant restarts it, as a reply would. A
+  /// request that will not consume any more is cancelled ([cancel]),
+  /// without a grant first. A grant made while the request itself waits to
+  /// be sent (a stream request made as an item or a chained response,
+  /// behind the item window of the request it answers) goes with it, in
+  /// the window its frame carries.
+  ///
+  /// Throws [ArgumentError] when [items] is below 1, or would bring the
+  /// window to [TalkFrame.unlimitedWindow] or beyond, and [StateError]
+  /// when the window is unlimited. Once the request ended (answered,
+  /// failed, cancelled) it sends nothing and the window stays as it was.
+  void grant(int items);
 
   /// The final response. It may carry a trailing payload and may itself be
   /// a request. Fails with the same exception as [items].
@@ -60,7 +96,10 @@ abstract class TalkStream {
   Future<TalkMessage> get done;
 
   /// When the requester timeout expires unless an answer arrives, as wall
-  /// clock time; null when the request has no timeout or has ended. For
+  /// clock time; null when the request has no timeout or has ended, while
+  /// its item window is exhausted ([window] 0: the timeout does not run
+  /// until the next [grant]), and while the request waits to be sent
+  /// behind the item window of the request it answers. For
   /// observation (a progress display, a log): the timeout itself runs on a
   /// monotonic clock.
   ///
@@ -81,6 +120,9 @@ abstract class TalkStream {
   /// or the requester timeout expires (the channel default if the request
   /// has none); anything arriving for it meanwhile is ignored, and item
   /// requests are answered with `ABORT CANCELLED`. Does nothing if the
-  /// request already ended.
+  /// request already ended. A request that still waits to be sent behind
+  /// the item window of the request it answers fails at once, and is sent
+  /// in its turn with the cancel right after it (a chained response still
+  /// answers that request).
   void cancel([Status? status]);
 }

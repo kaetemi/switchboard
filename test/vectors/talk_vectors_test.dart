@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GLM 5.3 Flash <noreply@z.ai>
 */
 
 import 'dart:typed_data';
@@ -43,13 +44,24 @@ final List<(String, String, TalkFrame)> positive = [
     TalkFrame(kind: TalkKind.message, responseId: 1, payload: hexBytes('FF')),
   ),
   (
-    'Stream request "LIST" id 2',
-    '0B 4C 49 53 54 00 00 00 00 02 00 00',
+    'Stream request "LIST" id 2, unlimited window',
+    '0B 4C 49 53 54 00 00 00 00 02 00 00 FF FF FF FF',
     TalkFrame(
       kind: TalkKind.message,
       procedure: Name('LIST'),
       requestId: 2,
       stream: true,
+    ),
+  ),
+  (
+    'Stream request "LIST" id 2, window 16',
+    '0B 4C 49 53 54 00 00 00 00 02 00 00 10 00 00 00',
+    TalkFrame(
+      kind: TalkKind.message,
+      procedure: Name('LIST'),
+      requestId: 2,
+      stream: true,
+      window: 16,
     ),
   ),
   (
@@ -100,6 +112,25 @@ final List<(String, String, TalkFrame)> positive = [
       kind: TalkKind.extend,
       responseId: 1,
       payload: TalkFrame.extendPayload(deadline: const Duration(minutes: 15)),
+    ),
+  ),
+  (
+    'Credit for own stream request 2, 8 more items',
+    '32 02 00 00 08 00 00 00',
+    TalkFrame(
+      kind: TalkKind.extend,
+      requestId: 2,
+      payload: TalkFrame.creditPayload(8),
+    ),
+  ),
+  (
+    'The same credit forwarded by a message chain proxy whose own request '
+        'toward the backend is 5',
+    '32 05 00 00 08 00 00 00',
+    TalkFrame(
+      kind: TalkKind.extend,
+      requestId: 5,
+      payload: TalkFrame.creditPayload(8),
     ),
   ),
   (
@@ -180,9 +211,18 @@ const List<(String, String)> negative = [
     '43 50 55 54 00 00 00 00 00 01 00 00 01 00 00 00',
   ),
   ('STREAM without HAS_REQUEST', '09 48 45 4C 4C 4F 00 00 00'),
+  (
+    'Stream request truncated before its window',
+    '0B 4C 49 53 54 00 00 00 00 02 00 00 FF FF',
+  ),
   ('Request id 0', '03 48 45 4C 4C 4F 00 00 00 00 00 00'),
   ('STREAM_ITEM without HAS_RESPONSE', '11 48 45 4C 4C 4F 00 00 00'),
-  ('EXTEND with HAS_REQUEST', '36 01 00 00 02 00 00'),
+  ('EXTEND with both ids', '36 01 00 00 02 00 00'),
+  ('EXTEND with neither id', '30'),
+  ('Credit with an 8-byte payload', '32 02 00 00 A0 BB 0D 00 E0 93 04 00'),
+  ('Credit of 0 items', '32 02 00 00 00 00 00 00'),
+  ('STREAM on a cancel', '2A 02 00 00 01 00'),
+  ('STREAM on a credit', '3A 02 00 00 08 00 00 00'),
   ('EXTEND with a 4-byte payload', '34 01 00 00 A0 BB 0D 00'),
   ('ABORT with both ids', '26 01 00 00 02 00 00 01 00'),
   ('Plain message without procedure', '00 01'),
@@ -207,8 +247,22 @@ const List<(String, String)> negativeExtra = [
   ('Empty input', ''),
   ('Response id 0', '04 00 00 00'),
   ('Chained with response id 0', '06 01 00 00 00 00 00'),
-  ('EXTEND without HAS_RESPONSE', '30'),
   ('EXTEND with STREAM and no request', '3C 01 00 00'),
+  ('Credit with STREAM and a window', '3A 02 00 00 FF FF FF FF 08 00 00 00'),
+  ('Cancel with STREAM and a window', '2A 02 00 00 FF FF FF FF 01 00'),
+  ('Credit with an empty payload', '32 02 00 00'),
+  ('Credit with a 3-byte payload', '32 02 00 00 08 00 00'),
+  ('Credit with a 5-byte payload', '32 02 00 00 08 00 00 00 00'),
+  (
+    'Credit with a procedure and 0 items',
+    '33 41 00 00 00 00 00 00 00 02 00 00 '
+        '00 00 00 00',
+  ),
+  ('Chained stream request without its window', '0E 04 00 00 03 00 00'),
+  (
+    'Item that is a stream request, truncated window',
+    '1E 05 00 00 03 00 00 04 00 00',
+  ),
   ('EXTEND with a 2-byte payload', '34 01 00 00 AA BB'),
   ('EXTEND with a 9-byte payload', '34 01 00 00 01 00 00 00 01 00 00 00 00'),
   ('STREAM_ITEM with only a request id', '13 48 45 4C 4C 4F 00 00 00 01 00 00'),
@@ -377,11 +431,14 @@ void main() {
     });
 
     test('chained stream request and item request decode', () {
-      // Final response to 3 that is stream request 4.
-      final chained = TalkFrame.decode(hexBytes('0E 04 00 00 03 00 00'));
+      // Final response to 3 that is stream request 4, unlimited window.
+      final chained = TalkFrame.decode(
+        hexBytes('0E 04 00 00 03 00 00 FF FF FF FF'),
+      );
       expect(chained.stream, isTrue);
       expect(chained.requestId, 4);
       expect(chained.responseId, 3);
+      expect(chained.window, TalkFrame.unlimitedWindow);
       // Stream item to 3 that is request 5.
       final item = TalkFrame.decode(hexBytes('16 05 00 00 03 00 00 AA'));
       expect(item.kind, TalkKind.streamItem);
@@ -396,6 +453,135 @@ void main() {
       expect(hexString(frame.payload), '01 02 03');
       bytes[4] = 0x7F;
       expect(frame.payload[0], 0x7F);
+    });
+  });
+
+  group('Item windows on the wire', () {
+    /// Decodes [hex], checks it encodes back to the same bytes, and
+    /// returns the frame.
+    TalkFrame roundTrip(String hex) {
+      final frame = TalkFrame.decode(hexBytes(hex));
+      expect(hexString(frame.encode()), hexString(hexBytes(hex)));
+      return frame;
+    }
+
+    test('a stream request carries its window after its ids', () {
+      // Window 0: nothing until a grant.
+      final zero = roundTrip('0B 4C 49 53 54 00 00 00 00 02 00 00 00 00 00 00');
+      expect(zero.window, 0);
+      expect(zero.payload, isEmpty);
+      // The largest finite window, with a payload after it.
+      final largest = roundTrip(
+        '0B 4C 49 53 54 00 00 00 00 02 00 00 FE FF FF FF AA BB',
+      );
+      expect(largest.window, TalkFrame.unlimitedWindow - 1);
+      expect(hexString(largest.payload), 'AA BB');
+      expect(largest.toString(), contains('window=4294967294'));
+      final unlimited = roundTrip(
+        '0B 4C 49 53 54 00 00 00 00 02 00 00 FF FF FF FF',
+      );
+      expect(unlimited.window, TalkFrame.unlimitedWindow);
+      // The window is part of the frame.
+      expect(zero, isNot(unlimited));
+      // Built rather than decoded.
+      expect(
+        hexString(
+          TalkFrame(
+            kind: TalkKind.message,
+            procedure: Name('LIST'),
+            requestId: 2,
+            stream: true,
+            window: 3,
+            payload: hexBytes('01'),
+          ).encode(),
+        ),
+        '0B 4C 49 53 54 00 00 00 00 02 00 00 03 00 00 00 01',
+      );
+    });
+
+    test('a chained response that is a stream request carries its window '
+        'after both ids', () {
+      // Final response to 3 that is stream request 4, window 2.
+      final chained = roundTrip('0E 04 00 00 03 00 00 02 00 00 00 CC');
+      expect(chained.kind, TalkKind.message);
+      expect(chained.requestId, 4);
+      expect(chained.responseId, 3);
+      expect(chained.stream, isTrue);
+      expect(chained.window, 2);
+      expect(hexString(chained.payload), 'CC');
+    });
+
+    test('an item that is a stream request carries its window after both '
+        'ids', () {
+      // Stream item to 3 that is stream request 5 "SUB", window 4.
+      final item = roundTrip(
+        '1F 53 55 42 00 00 00 00 00 05 00 00 03 00 00 04 00 00 00 AA',
+      );
+      expect(item.kind, TalkKind.streamItem);
+      expect(item.procedure, Name('SUB'));
+      expect(item.requestId, 5);
+      expect(item.responseId, 3);
+      expect(item.window, 4);
+      expect(hexString(item.payload), 'AA');
+      // The same, with a bulk payload: the reference follows the window.
+      final bulk = roundTrip(
+        '5E 05 00 00 03 00 00 00 00 00 00 02 00 00 00 00 00 00 00 00 00',
+      );
+      expect(bulk.bulk, isTrue);
+      expect(bulk.window, 0);
+      expect(bulk.bulkReference, TalkBulkReference(2, length: 0));
+      // withBulk keeps the window.
+      final windowed = TalkFrame(
+        kind: TalkKind.message,
+        procedure: Name('PUT'),
+        requestId: 1,
+        stream: true,
+        window: 7,
+      ).withBulk(TalkBulkReference(1));
+      expect(windowed.window, 7);
+      expect(TalkFrame.decode(windowed.encode()), windowed);
+    });
+
+    test('a credit names a request of its sender and counts items', () {
+      final credit = roundTrip('32 02 00 00 08 00 00 00');
+      expect(credit.kind, TalkKind.extend);
+      expect(credit.isCredit, isTrue);
+      expect(credit.requestId, 2);
+      expect(credit.hasResponse, isFalse);
+      expect(credit.creditItems, 8);
+      // A credit is not an extension, and an extension not a credit.
+      expect(() => credit.extension, throwsStateError);
+      final extend = TalkFrame.decode(hexBytes('34 01 00 00'));
+      expect(extend.isCredit, isFalse);
+      expect(() => extend.creditItems, throwsStateError);
+      // A procedure is optional and ignored.
+      final named = roundTrip(
+        '33 41 00 00 00 00 00 00 00 02 00 00 01 00 00 00',
+      );
+      expect(named.creditItems, 1);
+      // The largest count decodes on every platform; that it overflows
+      // any window is the channel's to say.
+      expect(
+        roundTrip('32 FF FF FF FF FF FF FF').creditItems,
+        TalkFrame.unlimitedWindow,
+      );
+      expect(hexString(TalkFrame.creditPayload(1)), '01 00 00 00');
+      expect(hexString(TalkFrame.creditPayload(0xFFFFFFFF)), 'FF FF FF FF');
+      expect(() => TalkFrame.creditPayload(0), throwsArgumentError);
+      expect(() => TalkFrame.creditPayload(0x100000000), throwsArgumentError);
+    });
+
+    test('frames that are not stream requests carry no window', () {
+      for (final hex in [
+        '03 47 45 54 5F 50 52 4F 46 01 00 00',
+        '15 49 54 45 4D 00 00 00 00 02 00 00 07',
+        '07 4D 4F 52 45 00 00 00 00 07 00 00 01 00 00',
+        '16 05 00 00 03 00 00 AA',
+      ]) {
+        final frame = roundTrip(hex);
+        expect(frame.stream, isFalse);
+        expect(frame.window, TalkFrame.unlimitedWindow);
+      }
     });
   });
 
@@ -422,10 +608,72 @@ void main() {
         'abort with both ids',
         () => TalkFrame(kind: TalkKind.abort, requestId: 1, responseId: 1),
       ),
-      ('extend without response', () => TalkFrame(kind: TalkKind.extend)),
+      ('extend without an id', () => TalkFrame(kind: TalkKind.extend)),
       (
-        'extend with request',
+        'extend with both ids',
         () => TalkFrame(kind: TalkKind.extend, requestId: 1, responseId: 1),
+      ),
+      (
+        'credit without a payload',
+        () => TalkFrame(kind: TalkKind.extend, requestId: 1),
+      ),
+      (
+        'credit with an extend payload',
+        () => TalkFrame(
+          kind: TalkKind.extend,
+          requestId: 1,
+          payload: TalkFrame.extendPayload(deadline: const Duration(hours: 1)),
+        ),
+      ),
+      (
+        'credit of 0 items',
+        () => TalkFrame(
+          kind: TalkKind.extend,
+          requestId: 1,
+          payload: Uint8List(4),
+        ),
+      ),
+      (
+        'credit with STREAM',
+        () => TalkFrame(
+          kind: TalkKind.extend,
+          requestId: 1,
+          stream: true,
+          payload: TalkFrame.creditPayload(1),
+        ),
+      ),
+      (
+        'cancel with STREAM',
+        () => TalkFrame(kind: TalkKind.abort, requestId: 1, stream: true),
+      ),
+      (
+        'window without STREAM',
+        () => TalkFrame(
+          kind: TalkKind.message,
+          procedure: Name('A'),
+          requestId: 1,
+          window: 4,
+        ),
+      ),
+      (
+        'negative window',
+        () => TalkFrame(
+          kind: TalkKind.message,
+          procedure: Name('A'),
+          requestId: 1,
+          stream: true,
+          window: -1,
+        ),
+      ),
+      (
+        'window over u32',
+        () => TalkFrame(
+          kind: TalkKind.message,
+          procedure: Name('A'),
+          requestId: 1,
+          stream: true,
+          window: 0x100000000,
+        ),
       ),
       (
         'extend with a 1-byte payload',

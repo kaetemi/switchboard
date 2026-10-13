@@ -119,11 +119,54 @@ abstract class TalkMessage {
   /// True when the peer accepts stream items before the final reply.
   bool get expectsStream => frame.stream;
 
+  /// For a stream request with a finite item window (wiki page "Polyverse
+  /// Switchboard Talk", "Item windows"): how many more items the peer has
+  /// granted, the window it opened with and every credit since, less the
+  /// items sent ([replyItem], [replyItemBulk] and the item requests each
+  /// count as one). Null when the window is unlimited, and for a message
+  /// that is not a stream request.
+  ///
+  /// At 0 the window is exhausted: an item waits for a grant (the future
+  /// of [replyItem] with it, nothing on the wire), [replyStream] pauses its
+  /// source, and the responder timeout does not run; the credit bound runs
+  /// instead while something waits for a grant ([setCreditTimeout]). The
+  /// final reply, [replyAbort] and [extend] are never counted and never
+  /// wait for a grant, except that a final reply goes after the items made
+  /// before it.
+  int? get window;
+
+  /// Completes once [window] is above 0, or the request has ended
+  /// (answered, cancelled, the channel closed); at once when it is, and
+  /// when the window is unlimited. Never fails.
+  ///
+  /// For a responder that should not produce an item it cannot deliver,
+  /// and that, after a long wait, rechecks what it must (an authorisation,
+  /// a snapshot) before producing the next. While it is waited for, the
+  /// credit bound runs ([setCreditTimeout]).
+  Future<void> get whenCredit;
+
+  /// Overrides the credit bound for this request: how long it may wait for
+  /// a grant while its item window is exhausted and this side has
+  /// something to send (an item waiting, a [replyStream] source paused,
+  /// [whenCredit] waited for), and, for a request opened with window 0,
+  /// from its arrival (for one with a bulk payload, from its delivery, as
+  /// the responder timeout) until the first grant. On expiry the channel
+  /// answers `ABORT DEADLINE_EXCEEDED` on the application's behalf, what
+  /// waited for the window is not sent, and the request is cancelled
+  /// ([onCancel]).
+  ///
+  /// [TalkOptions.creditTimeout] when [timeout] is null, none when it is
+  /// [Duration.zero]. A bound that is running restarts with the new value.
+  /// For a consumer known to be slow. Does nothing for a request with an
+  /// unlimited window, or once it is finished.
+  void setCreditTimeout(Duration? timeout);
+
   /// True once the peer cancelled this request, or once the request can no
-  /// longer be answered: the responder timeout expired, the channel closed,
-  /// the peer reused its id, or the listener it was delivered to threw
-  /// before answering it (the channel then answered `ABORT INTERNAL`). Work
-  /// on the request should stop.
+  /// longer be answered: the responder timeout or the credit bound
+  /// ([setCreditTimeout]) expired, the channel closed, the peer reused its
+  /// id, or the listener it was delivered to threw before answering it (the
+  /// channel then answered `ABORT INTERNAL`). Work on the request should
+  /// stop.
   bool get isCancelled;
 
   /// Completes when [isCancelled] becomes true. Never completes for a
@@ -143,8 +186,9 @@ abstract class TalkMessage {
   Future<void> get onCancel;
 
   /// True while a reply method may still be called: the message expects a
-  /// reply, no final reply was sent (by the application, by the responder
-  /// timeout, or by the channel), and the channel is open.
+  /// reply, no final reply was made (by the application, sent or waiting
+  /// behind items for the item window, by the responder timeout, or by the
+  /// channel), and the channel is open.
   bool get canReply;
 
   /// Sends the final response.
@@ -154,6 +198,17 @@ abstract class TalkMessage {
   /// carry a trailing [payload]. A [payload] too large for the channel's
   /// frames (or for [TalkOptions.bulkThreshold]) is sent as a bulk payload
   /// transparently; so are those of the other reply methods.
+  ///
+  /// The final response is never counted against the item window
+  /// ([window]) and never waits for a grant itself, so a stream that ends
+  /// while the window is exhausted ends at once. Made while items wait for
+  /// a grant, it goes after them, and the request counts as answered
+  /// meanwhile ([canReply] is false; a listener that throws after making
+  /// it does not abort the request); if the request ends first (the
+  /// peer's cancel, the credit bound, the channel's end) it is not sent
+  /// and its future fails with the reason. The same holds for the chained
+  /// responses ([startReplyRequest] and the others, whose request is then
+  /// not sent either and fails likewise) and [replyBulk].
   ///
   /// The returned future completes once the response was handed to the
   /// connection within the channel's send window (for a bulk payload,
@@ -204,13 +259,16 @@ abstract class TalkMessage {
 
   /// Sends the final response as a stream request of our own.
   ///
-  /// Takes and throws like [startReplyRequest].
+  /// [window] is its item window, as for [TalkChannel.streamRequest] (null:
+  /// unlimited). Takes and throws like [startReplyRequest], and
+  /// [RangeError] for a [window] out of range.
   TalkStream replyStreamRequest(
     Uint8List payload, {
     String? procedure,
     Duration? timeout,
     void Function(Duration? deadline, Duration? renew)? onExtend,
     Name? name,
+    int? window,
   });
 
   /// Sends the final response with a bulk payload read from [bytes], whose
@@ -240,6 +298,15 @@ abstract class TalkMessage {
   /// once that payload went whole as well), as [reply]'s does: a responder
   /// that awaits it before the next item is paced by the requester, and
   /// holds at most one item beyond what the requester granted.
+  ///
+  /// For a stream request with a finite item window ([window]) the item
+  /// takes one item of it: while the window is exhausted, or other replies
+  /// wait for it, the item is queued in order (nothing goes on the wire)
+  /// and the future completes once a grant let it go; it fails with the
+  /// reason when the request ends first (the peer's cancel: `CANCELLED`;
+  /// the credit bound: `DEADLINE_EXCEEDED`; the channel's end: its
+  /// status). The same holds for [replyItemBulk] and the item requests,
+  /// whose request waits likewise (its handle is returned at once).
   ///
   /// Throws [SwitchboardException] with [StatusCode.failedPrecondition]
   /// like [reply], and also if the request is not a stream request
@@ -284,13 +351,16 @@ abstract class TalkMessage {
   /// Sends one stream item that is itself a stream request. Restarts the
   /// responder timeout.
   ///
-  /// Takes and throws like [startReplyItemRequest].
+  /// [window] is its item window, as for [TalkChannel.streamRequest] (null:
+  /// unlimited). Takes and throws like [startReplyItemRequest], and
+  /// [RangeError] for a [window] out of range.
   TalkStream replyItemStreamRequest(
     Uint8List payload, {
     String? procedure,
     Duration? timeout,
     void Function(Duration? deadline, Duration? renew)? onExtend,
     Name? name,
+    int? window,
   });
 
   /// Answers a stream request with [items]: each one is sent with
@@ -299,6 +369,16 @@ abstract class TalkMessage {
   /// final reply. The subscription to [items] is paused while an item
   /// waits for the channel's send window ([replyItem]'s future), so that
   /// a requester that does not read paces the source.
+  ///
+  /// With a finite item window ([window]) the source is paused the same
+  /// way while an item waits for a grant, holding that one item read
+  /// ahead: the end of the source is seen while the window is exhausted,
+  /// and the final reply goes at once. An `async*` source is thus
+  /// suspended at its `yield` while the window is exhausted, and resumes
+  /// there once a grant let the item go; it can await [whenCredit] before
+  /// producing an item it should not produce early. [creditTimeout], when
+  /// given, is the request's credit bound ([setCreditTimeout]), how long
+  /// the source may wait for a grant.
   ///
   /// An error event on [items] ends the answer with [replyAbort]: the
   /// error's status if it is a [SwitchboardException] (a
@@ -328,9 +408,13 @@ abstract class TalkMessage {
     Uint8List? trailer,
     String? procedure,
     Name? name,
+    Duration? creditTimeout,
   }) {
     final wire = name ?? (procedure == null ? null : Name(procedure));
     _checkStreamReply();
+    if (creditTimeout != null) {
+      setCreditTimeout(creditTimeout);
+    }
     final done = Completer<void>();
     late final StreamSubscription<Uint8List> subscription;
     var stopping = false;
@@ -391,8 +475,9 @@ abstract class TalkMessage {
           unawaited(stop());
           return;
         }
-        // The source waits while the item waits for the window; a failed
-        // item (the channel ended) resumes it, for the end to be seen.
+        // The source waits while the item waits for the window, the
+        // channel's or the request's item window; a failed item (the
+        // channel ended) resumes it, for the end to be seen.
         subscription.pause(sent.then<void>((_) {}, onError: (Object _) {}));
       },
       onError: (Object error, StackTrace stackTrace) {

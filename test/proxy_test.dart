@@ -128,6 +128,37 @@ Future<Piped> piped({
 
 void main() {
   group('pipeChannels', () {
+    test('the loss of the backend while an item window is exhausted fails '
+        'the requester with the channel status', () async {
+      final p = await piped();
+      final clientTalk = TalkChannel(p.client);
+      final backendTalk = TalkChannel(p.backend);
+      final held = Completer<TalkMessage>();
+      backendTalk.messages.listen(held.complete);
+      final s = clientTalk.streamRequest('LIST', Uint8List(0), window: 1);
+      final items = <String>[];
+      s.items.listen((i) => items.add(utf8.decode(i.payload)), onError: (_) {});
+      final m = await held.future;
+      await m.replyItem(bytes('a'));
+      final waiting = m.replyItem(bytes('b'));
+      while (items.isEmpty) {
+        await pumpEventQueue();
+      }
+      expect(s.window, 0);
+      await backendTalk.close(Status.of(StatusCode.aborted, 'backend lost'));
+      final status = await clientTalk.done;
+      expect(status, hasCode(StatusCode.aborted));
+      await expectLater(
+        s.done,
+        throwsA(
+          isA<SwitchboardException>().having((e) => e.status, 'status', status),
+        ),
+      );
+      await expectLater(waiting, throwsCode(StatusCode.aborted));
+      expect(items, ['a']);
+      await p.pipe;
+    });
+
     test(
       'a bulk drain timeout forwards failure and cancels the twins',
       () async {
@@ -603,6 +634,9 @@ void main() {
     late Uri backendUri;
     late Uri endpointUri;
     late List<IncomingChannel> atBackend;
+    // The TICKS source of the backend: the items it produced, and its end.
+    late int ticksProduced;
+    late Completer<void> ticksEnded;
 
     Switchboard node({
       Resolver? resolver,
@@ -621,6 +655,8 @@ void main() {
 
     setUp(() async {
       atBackend = [];
+      ticksProduced = 0;
+      ticksEnded = Completer<void>();
       backend = node(defaultPayload: bytes('backend credential'));
       backendUri = await backend.listenTcp('127.0.0.1', 0);
       backend.registerService(chat, (incoming) {
@@ -653,6 +689,19 @@ void main() {
               unawaited(
                 m.replyBulk(Stream.value(pattern(300000)), length: 300000),
               );
+            case 'TICKS':
+              // Endless, paced by the requester's item window.
+              Stream<Uint8List> ticks() async* {
+                try {
+                  for (var i = 0; ; i++) {
+                    ticksProduced++;
+                    yield bytes('$i');
+                  }
+                } finally {
+                  ticksEnded.complete();
+                }
+              }
+              unawaited(m.replyStream(ticks()));
           }
         });
       }, instance: 7);
@@ -750,6 +799,39 @@ void main() {
           .toList();
       expect(items, ['1', '2', '3']);
       expect((await stream.done).payload, bytes('done'));
+      await talk.close();
+    });
+
+    test('a stream with a finite item window through the endpoint: grants, '
+        'a request served meanwhile, a cancel', () async {
+      final talk = await client.openTalk(ServiceAddress(chat, 7));
+      final s = talk.streamRequest('TICKS', Uint8List(0), window: 2);
+      final items = <String>[];
+      s.items.listen((i) => items.add(utf8.decode(i.payload)), onError: (_) {});
+      Future<void> quiet() =>
+          Future<void>.delayed(const Duration(milliseconds: 50));
+      while (items.length < 2) {
+        await quiet();
+      }
+      await quiet();
+      // Nothing beyond the window; one item read ahead at the backend.
+      expect(items, ['0', '1']);
+      expect(ticksProduced, 3);
+      // The channel serves other calls while the stream waits.
+      final who = await talk.request('WHO', Uint8List(0));
+      expect(utf8.decode(who.payload), startsWith('chat 7'));
+      s.grant(3);
+      while (items.length < 5) {
+        await quiet();
+      }
+      await quiet();
+      expect(items, ['0', '1', '2', '3', '4']);
+      expect(ticksProduced, 6);
+      s.cancel();
+      await expectLater(s.done, throwsCode(StatusCode.cancelled));
+      await ticksEnded.future;
+      await quiet();
+      expect(items, hasLength(5));
       await talk.close();
     });
 

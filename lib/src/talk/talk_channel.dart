@@ -6,6 +6,7 @@ Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
   GPT-6 Astra <noreply@openai.com>
+  GLM 5.3 Flash <noreply@z.ai>
 */
 
 import 'dart:async';
@@ -60,6 +61,7 @@ class TalkOptions {
     this.bulkOpenTimeout = const Duration(seconds: 10),
     this.bulkIdleTimeout = const Duration(seconds: 30),
     this.streamBulk,
+    this.creditTimeout = const Duration(seconds: 60),
   });
 
   /// Default [bulkChunkSize]: 64 KiB.
@@ -238,6 +240,22 @@ class TalkOptions {
   /// that reads only `payload` never notices bulk payloads. Replies
   /// relayed by `forwardMessage` always stream.
   final bool Function(TalkMessage message)? streamBulk;
+
+  /// Responder side: the credit bound, how long a stream request with a
+  /// finite item window (see [TalkChannel.streamRequest]) may stay
+  /// exhausted while this side has something to send (an item waiting for
+  /// a grant, a [TalkMessage.replyStream] source paused, a
+  /// [TalkMessage.whenCredit] waited for), and, for a request opened with
+  /// window 0, from its arrival (for one with a bulk payload, from its
+  /// delivery, as [replyTimeout]) until the first grant. On expiry the
+  /// channel answers `ABORT DEADLINE_EXCEEDED` on the application's
+  /// behalf, and what waited for the window is not sent. While the window is exhausted the responder and requester
+  /// timeouts do not run: the requester is the cause of the wait, and this
+  /// bounds it instead (wiki page "Polyverse Switchboard Talk", "Timeouts",
+  /// "Credit"). Overridable per request with
+  /// [TalkMessage.setCreditTimeout]. [Duration.zero]: no bound. Default
+  /// 60 s.
+  final Duration creditTimeout;
 }
 
 /// A failure caused by the peer sending `ABORT`: an abort response to one
@@ -865,7 +883,7 @@ class TalkChannel {
         onExtend: onExtend,
         ordered: ordered,
         bulk: source,
-        build: (id) => TalkFrame(
+        build: (id, _) => TalkFrame(
           kind: TalkKind.message,
           procedure: wire,
           requestId: id,
@@ -879,6 +897,24 @@ class TalkChannel {
   /// the returned [TalkStream]. Takes, throws and paces like
   /// [startRequest]; the requester timeout is also restarted by every item
   /// (and, once the peer declared a renewal, renewed by every item).
+  ///
+  /// [window] is the request's item window (wiki page "Polyverse
+  /// Switchboard Talk", "Item windows"): how many items the responder may
+  /// send before this side grants more with [TalkStream.grant], counted in
+  /// items whatever their size (an item that is itself a request, or
+  /// carries a bulk payload, counts as one); 0 for none until a grant.
+  /// Null, the default, is unlimited: the channel's flow control alone
+  /// bounds the stream. The final response, an abort and `EXTEND` are never
+  /// counted, so a result that ends within the window, or is empty,
+  /// completes without a grant. Grant what the application has consumed
+  /// (for a durable consumer, committed), not what it can store; nothing is
+  /// granted on its behalf. While the window is exhausted the requester
+  /// timeout does not run (see [TalkStream.deadline]): the responder bounds
+  /// the wait for a grant by its own credit bound
+  /// ([TalkOptions.creditTimeout]) and aborts with `DEADLINE_EXCEEDED`.
+  ///
+  /// Throws like [startRequest], and [RangeError] for a [window] that is
+  /// negative or not below [TalkFrame.unlimitedWindow].
   TalkStream streamRequest(
     String procedure,
     Uint8List payload, {
@@ -887,24 +923,45 @@ class TalkChannel {
     Name? name,
     Stream<List<int>>? bulk,
     int? bulkLength,
+    int? window,
   }) {
     final wire = name ?? Name(procedure);
+    final items = windowOf(window);
     final source = _bulkSource(payload, bulk, bulkLength);
     return _TalkStream(
       _startRequest(
         stream: true,
+        window: items,
         timeout: timeout,
         onExtend: onExtend,
         bulk: source,
-        build: (id) => TalkFrame(
+        build: (id, window) => TalkFrame(
           kind: TalkKind.message,
           procedure: wire,
           requestId: id,
           stream: true,
+          window: window,
           payload: payload,
         ),
       ),
     );
+  }
+
+  /// The wire value of an item window given to the request API: null is
+  /// [TalkFrame.unlimitedWindow]. Throws [RangeError] for a value that is
+  /// negative or not below it.
+  @internal
+  static int windowOf(int? window) {
+    if (window == null) {
+      return TalkFrame.unlimitedWindow;
+    }
+    RangeError.checkValueInInterval(
+      window,
+      0,
+      TalkFrame.unlimitedWindow - 1,
+      'window',
+    );
+    return window;
   }
 
   /// Sends a channel abort carrying [status], then closes the channel with
@@ -1317,15 +1374,23 @@ class TalkChannel {
     );
   }
 
+  /// Registers one of our requests and sends its frame, built by [build]
+  /// from the request id and the item window to put on the wire. With
+  /// [deferred] the request is registered and its handle returned, but
+  /// nothing is sent until [_Outgoing.send] is called (an item request or
+  /// a chained final waiting for the item window of the request it
+  /// answers, see [_Message._queue]).
   _Outgoing _startRequest({
     required bool stream,
     required Duration? timeout,
-    required TalkFrame Function(int id) build,
+    required TalkFrame Function(int id, int window) build,
+    int window = TalkFrame.unlimitedWindow,
     void Function(Duration? deadline, Duration? renew)? onExtend,
     _ResponseSink? sink,
     bool ordered = false,
     _BulkSource? bulk,
     void Function()? onAccepted,
+    bool deferred = false,
   }) {
     if (_closing) {
       throw SwitchboardException.of(
@@ -1345,12 +1410,12 @@ class TalkChannel {
     while (_outgoing.containsKey(id)) {
       id = id >= TalkFrame.maxId ? 1 : id + 1;
     }
-    final frame = build(id);
     final pending = _Outgoing(
       this,
       id,
       timeout ?? options.requestTimeout,
       stream: stream,
+      window: stream && window != TalkFrame.unlimitedWindow ? window : null,
       onExtend: onExtend,
       sink: sink,
       ordered: ordered,
@@ -1359,43 +1424,61 @@ class TalkChannel {
     // can arrive while the request is still being sent.
     _outgoing[id] = pending;
     _nextRequestId = id >= TalkFrame.maxId ? 1 : id + 1;
-    pending.startTimer();
-    try {
-      _sendFrame(
-        frame,
-        bulk: bulk,
-        onBulk: (out) {
-          final stopped = pending.bulkStopped;
-          if (stopped != null) {
-            // The frame waited for the peer's LIMITS, and the request was
-            // cancelled or failed locally meanwhile.
-            out.cancel(stopped);
-            return;
-          }
-          out.track(pending.bulkOuts);
-          // The request's payload going out is progress: the requester
-          // timeout restarts with each chunk the receiver takes.
-          out.onProgress = () {
-            if (!pending.ended && !pending.finalReceived) {
-              pending.replied();
+    pending.send = () {
+      pending
+        ..queued = false
+        ..startTimer();
+      try {
+        // The window granted while the request waited goes with it.
+        _sendFrame(
+          build(id, pending.window ?? TalkFrame.unlimitedWindow),
+          bulk: bulk,
+          onBulk: (out) {
+            final stopped = pending.bulkStopped;
+            if (stopped != null) {
+              // The frame waited for the peer's LIMITS, or for the window
+              // of the request it answers, and the request was cancelled
+              // or failed locally meanwhile.
+              out.cancel(stopped);
+              return;
             }
-          };
-        },
-        // Only when the frame waited for the peer's LIMITS.
-        onFailure: (error) {
-          if (identical(_outgoing[id], pending)) {
-            _outgoing.remove(id);
-          }
-          pending.fail(error);
-        },
-        onAccepted: onAccepted,
-      );
-    } catch (_) {
-      if (identical(_outgoing[id], pending)) {
-        _outgoing.remove(id);
+            out.track(pending.bulkOuts);
+            // The request's payload going out is progress: the requester
+            // timeout restarts with each chunk the receiver takes.
+            out.onProgress = () {
+              if (!pending.ended && !pending.finalReceived) {
+                pending.replied();
+              }
+            };
+          },
+          // Only when the frame waited for the peer's LIMITS.
+          onFailure: (error) {
+            if (identical(_outgoing[id], pending)) {
+              _outgoing.remove(id);
+            }
+            pending.fail(error);
+          },
+          onAccepted: onAccepted,
+        );
+      } catch (_) {
+        if (identical(_outgoing[id], pending)) {
+          _outgoing.remove(id);
+        }
+        pending.stopTimer();
+        rethrow;
       }
-      pending.stopTimer();
-      rethrow;
+      final cancelled = pending.cancelWhenSent;
+      if (cancelled != null) {
+        // Cancelled while it waited: the peer is told now that it knows of
+        // the request.
+        pending.cancelWhenSent = null;
+        _sendCancel(pending, cancelled);
+      }
+    };
+    if (deferred) {
+      pending.queued = true;
+    } else {
+      pending.send!();
     }
     return pending;
   }
@@ -1439,6 +1522,32 @@ class TalkChannel {
       return;
     }
     pending.abandoned = true;
+    if (pending.queued) {
+      // Not sent yet: it waits for the item window of the request it
+      // answers, and keeps its place there (a chained final is still the
+      // answer to that request). The cancel follows it once it went.
+      pending.cancelWhenSent = status;
+      pending.fail(SwitchboardException(status));
+      return;
+    }
+    pending.fail(SwitchboardException(status));
+    _sendCancel(pending, status);
+  }
+
+  /// [pending], registered but not sent ([_startRequest] with `deferred`),
+  /// will not be sent: it fails with [error] and its id is released.
+  void _dropOutgoing(_Outgoing pending, SwitchboardException error) {
+    if (identical(_outgoing[pending.id], pending)) {
+      _outgoing.remove(pending.id);
+    }
+    pending
+      ..cancelWhenSent = null
+      ..fail(error);
+  }
+
+  /// Sends the cancel of [pending], abandoned, and keeps its id until the
+  /// peer's final response arrives, or on timeout.
+  void _sendCancel(_Outgoing pending, Status status) {
     _trySend(
       TalkFrame(
         kind: TalkKind.abort,
@@ -1446,7 +1555,6 @@ class TalkChannel {
         payload: _wireAbortStatus(status).encode(),
       ),
     );
-    pending.fail(SwitchboardException(status));
     if (!identical(_outgoing[pending.id], pending)) {
       // Over a synchronous transport the final can arrive during the send.
       return;
@@ -1499,7 +1607,9 @@ class TalkChannel {
       // answer before (see [_attachBulk]).
       message._timerDeferred = true;
     } else {
-      message._startTimer();
+      message
+        .._startTimer()
+        .._armCredit();
     }
     return true;
   }
@@ -2188,7 +2298,7 @@ class TalkChannel {
       return;
     }
     final pending = _outgoing[frame.responseId];
-    if (pending == null || pending.finalReceived) {
+    if (pending == null || !pending.awaitsResponse) {
       _credit(wire);
       _discardBulk(frame);
       _unknownResponse(frame);
@@ -2278,7 +2388,7 @@ class TalkChannel {
 
   void _onStreamItem(TalkFrame frame, int wire) {
     final pending = _outgoing[frame.responseId];
-    if (pending == null || pending.finalReceived) {
+    if (pending == null || !pending.awaitsResponse) {
       _credit(wire);
       _discardBulk(frame);
       _unknownResponse(frame);
@@ -2300,7 +2410,15 @@ class TalkChannel {
       _protocolError('STREAM_ITEM for non-stream request ${pending.id}');
       return;
     }
-    pending.replied();
+    if (pending.window == 0) {
+      // The responder may not exceed the window (wiki page "Polyverse
+      // Switchboard Talk", "Item windows"); as for a request without
+      // STREAM, a channel protocol error on its part.
+      _credit(wire);
+      _protocolError('STREAM_ITEM beyond the window of request ${pending.id}');
+      return;
+    }
+    pending.itemArrived();
     final message = _Message(this, frame).._creditBytes = wire;
     if (frame.hasRequest) {
       _register(message);
@@ -2334,7 +2452,7 @@ class TalkChannel {
   void _onAbort(TalkFrame frame) {
     if (frame.hasResponse) {
       final pending = _outgoing[frame.responseId];
-      if (pending == null || pending.finalReceived) {
+      if (pending == null || !pending.awaitsResponse) {
         _log.fine('abort for unknown request ${frame.responseId} ignored');
         return;
       }
@@ -2380,8 +2498,23 @@ class TalkChannel {
   }
 
   void _onExtend(TalkFrame frame, int wire) {
+    if (frame.isCredit) {
+      // Consumed here, its credit back at once.
+      _credit(wire);
+      final message = _incoming[frame.requestId];
+      if (message == null) {
+        // Not outstanding: it may have raced the end of the request.
+        _log.fine('credit for unknown request ${frame.requestId} ignored');
+        return;
+      }
+      final error = message._onCredit(frame.creditItems);
+      if (error != null) {
+        _protocolError(error);
+      }
+      return;
+    }
     final pending = _outgoing[frame.responseId];
-    if (pending == null || pending.abandoned || pending.finalReceived) {
+    if (pending == null || pending.abandoned || !pending.awaitsResponse) {
       _credit(wire);
       return;
     }
@@ -2497,7 +2630,7 @@ class TalkChannel {
     final incoming = _incoming.values.toList();
     _incoming.clear();
     for (final message in incoming) {
-      message._abandon();
+      message._abandon(error);
     }
     // What a dropped message referenced is not waited for.
     _bulkAwaited.removeWhere((_, awaited) {
@@ -2591,7 +2724,7 @@ class TalkChannel {
     final incoming = _incoming.values.toList();
     _incoming.clear();
     for (final message in incoming) {
-      message._abandon();
+      message._abandon(error);
     }
     // What arrived whole keeps its place; what waits for a bulk payload
     // in transfer is dropped with it.
@@ -2785,6 +2918,7 @@ class _Outgoing {
     this.id,
     this.timeout, {
     required bool stream,
+    this.window,
     this.onExtend,
     this.sink,
     this.ordered = false,
@@ -2846,8 +2980,38 @@ class _Outgoing {
   bool abandoned = false;
   bool _failed = false;
 
+  /// The item window as this side sees it, for a stream request with a
+  /// finite one: what it granted (the window it opened with, and every
+  /// grant since) less the items that arrived. Null when unlimited, and
+  /// for a request that is not a stream request.
+  int? window;
+
+  /// Registered, its frame not sent yet: it waits for the item window of
+  /// the peer's request it answers ([TalkChannel._startRequest] with
+  /// `deferred`).
+  bool queued = false;
+
+  /// Sends the frame of the request; set by [TalkChannel._startRequest].
+  void Function()? send;
+
+  /// The status of a cancel made while [queued], sent once the frame went.
+  Status? cancelWhenSent;
+
   /// Answered, failed or cancelled.
   bool get ended => _failed || completer.isCompleted || abandoned;
+
+  /// Whether what the peer sends for [id] can answer this request: not
+  /// once its final arrived, nor before its frame went ([queued]), which
+  /// the peer cannot know of: what arrives for the id then is stale (for an
+  /// earlier request with the id) or invented, and is treated as for an
+  /// unknown id.
+  bool get awaitsResponse => !finalReceived && !queued;
+
+  /// The window is exhausted: as many items arrived as were granted, so the
+  /// requester timeout does not run (wiki page "Polyverse Switchboard
+  /// Talk", "Timeouts", "Credit"). Not once the request was cancelled: the
+  /// timer then keeps its id until the final arrives.
+  bool get exhausted => window == 0 && !abandoned;
 
   /// When the request times out, as wall clock time; null if it never
   /// does, or has ended.
@@ -2867,10 +3031,89 @@ class _Outgoing {
     _arm();
   }
 
-  /// A stream item arrived.
+  /// A stream item arrived, or a chunk of the bulk payload of one.
   void replied() {
     expiry.reply(monotonicNow());
     _arm();
+  }
+
+  /// A stream item arrived: it takes one item of the window, and restarts
+  /// the timeout as any reply does. An item beyond the window never gets
+  /// here ([TalkChannel._onStreamItem] closes the channel first).
+  void itemArrived() {
+    final window = this.window;
+    if (window != null) {
+      this.window = window - 1;
+    }
+    replied();
+  }
+
+  /// [TalkStream.grant]: grants the peer [items] more items of the window.
+  void grant(int items) {
+    if (items < 1) {
+      throw ArgumentError.value(items, 'items', 'must be at least 1');
+    }
+    final window = this.window;
+    if (window == null) {
+      throw StateError(
+        isStream
+            ? 'request $id has an unlimited window'
+            : 'request $id is not a stream request',
+      );
+    }
+    if (ended || finalReceived || !identical(channel._outgoing[id], this)) {
+      return;
+    }
+    if (window + items >= TalkFrame.unlimitedWindow) {
+      throw ArgumentError.value(
+        items,
+        'items',
+        'would bring the window of request $id to ${window + items}, '
+            'beyond ${TalkFrame.unlimitedWindow - 1}',
+      );
+    }
+    addCredit(items);
+  }
+
+  /// A credit the peer granted for the request this one was forwarded for,
+  /// passed on ([forwardMessage]): what [grant] does without its checks,
+  /// which the peer's credit passed already, and doing nothing once the
+  /// request ended.
+  void forwardCredit(int items) {
+    final window = this.window;
+    if (window == null ||
+        ended ||
+        finalReceived ||
+        !identical(channel._outgoing[id], this)) {
+      return;
+    }
+    if (window + items >= TalkFrame.unlimitedWindow) {
+      // Cannot happen: this side relayed at most what it received.
+      _log.warning('credit of $items items overflows request $id, dropped');
+      return;
+    }
+    addCredit(items);
+  }
+
+  /// Adds [items] to the window and sends the credit; one granted while the
+  /// request itself waits to be sent goes with it instead. The requester
+  /// timeout restarts, as a reply would, if the window was exhausted.
+  void addCredit(int items) {
+    final wasExhausted = exhausted;
+    window = window! + items;
+    if (queued) {
+      return;
+    }
+    channel._trySend(
+      TalkFrame(
+        kind: TalkKind.extend,
+        requestId: id,
+        payload: TalkFrame.creditPayload(items),
+      ),
+    );
+    if (wasExhausted && !ended) {
+      replied();
+    }
   }
 
   /// Keeps the id of a cancelled request for [duration] at most.
@@ -2885,7 +3128,8 @@ class _Outgoing {
   Duration? _armedEnd;
 
   void _arm() {
-    final end = expiry.end;
+    // While the window is exhausted the timeout does not run.
+    final end = exhausted || queued ? null : expiry.end;
     if (end != null && end == _armedEnd && timer != null) {
       return;
     }
@@ -3111,10 +3355,21 @@ class _TalkStream extends TalkStream {
     _pending,
     status ?? Status.of(StatusCode.cancelled),
   );
+
+  @override
+  int? get window => _pending.window;
+
+  @override
+  void grant(int items) => _pending.grant(items);
 }
 
 class _Message extends TalkMessage {
-  _Message(this.channel, this.frame) : _finished = frame.requestId == 0;
+  _Message(this.channel, this.frame)
+    : _finished = frame.requestId == 0,
+      _window = frame.stream && frame.window != TalkFrame.unlimitedWindow
+          ? frame.window
+          : null,
+      _awaitingGrant = frame.stream && frame.window == 0;
 
   @override
   final TalkChannel channel;
@@ -3246,6 +3501,7 @@ class _Message extends TalkMessage {
     _timerDeferred = false;
     if (!_finished && expectsReply) {
       _startTimer();
+      _armCredit();
     }
   }
 
@@ -3422,6 +3678,65 @@ class _Message extends TalkMessage {
   /// The status of a peer cancel that arrived while a reply was being sent.
   Status? _heldCancel;
 
+  // Item window (wiki page "Polyverse Switchboard Talk", "Item windows"),
+  // for a stream request whose window is finite.
+
+  /// What the peer granted (the window it opened with, and every credit
+  /// since) less the items sent; null when unlimited, and for any other
+  /// message.
+  int? _window;
+
+  /// Opened with window 0, and no credit arrived yet: the credit bound runs
+  /// from the request's arrival.
+  bool _awaitingGrant;
+
+  /// Replies waiting for the window, in the order they were made: items
+  /// while it is exhausted, and anything after them (a final response
+  /// waits behind the items before it).
+  Queue<_Queued>? _queue;
+
+  /// [_flush] is running.
+  bool _flushing = false;
+
+  /// The final reply waits in [_queue]: the request counts as answered.
+  bool _finalQueued = false;
+
+  /// [whenCredit] is waited for.
+  Completer<void>? _creditWaiter;
+
+  /// Credit bound override; null means the channel default.
+  Duration? _creditTimeout;
+
+  /// The credit bound, while it runs: when it expires ([monotonicNow]).
+  Duration? _creditEnd;
+  Timer? _creditTimer;
+
+  /// Called with each credit the peer grants, once [forwardMessage] took
+  /// this request over: passes it on.
+  void Function(int items)? _creditHook;
+
+  /// Items of the window that replies of the application's own, waiting
+  /// for it when [forwardMessage] took the request over, still take: the
+  /// credits that cover them are not passed to [_creditHook], so that what
+  /// the far responder may send fits in what they leave.
+  int _creditOwed = 0;
+
+  /// The items in [_queue]: replies that wait for the window, each taking
+  /// one item of it.
+  int get _queuedItems {
+    var count = 0;
+    for (final queued in _queue ?? const <_Queued>[]) {
+      if (queued.counts) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  /// Why replies still waiting for the window are not sent, when the
+  /// request ends with an abort.
+  SwitchboardException? _dropError;
+
   @override
   bool get isCancelled => _cancelled;
 
@@ -3429,7 +3744,239 @@ class _Message extends TalkMessage {
   Future<void> get onCancel => (_cancelCompleter ??= Completer<void>()).future;
 
   @override
-  bool get canReply => !_finished && !_finalizing && channel.isOpen;
+  bool get canReply =>
+      !_finished && !_finalizing && !_finalQueued && channel.isOpen;
+
+  @override
+  int? get window => _window;
+
+  @override
+  Future<void> get whenCredit {
+    final window = _window;
+    if (window == null || window > 0 || _finished || _cancelled) {
+      return Future<void>.value();
+    }
+    final waiter = _creditWaiter ??= Completer<void>();
+    // Waiting for a grant is having something to send.
+    _armCredit();
+    return waiter.future;
+  }
+
+  @override
+  void setCreditTimeout(Duration? timeout) {
+    _creditTimeout = timeout;
+    // Restarted with the new bound, if it runs.
+    _stopCredit();
+    _armCredit();
+  }
+
+  /// Whether a stream item can go now: the window has room, and nothing
+  /// waits for it before the item.
+  bool get _itemCanGo => _window != 0 && (_queue?.isEmpty ?? true);
+
+  /// Counts one item sent against the window. Returns whether it did: not
+  /// for an unlimited window, nor at 0 (an item [forwardMessage] relays,
+  /// which keeps no window of its own).
+  bool _take() {
+    final window = _window;
+    if (window == null || window == 0) {
+      return false;
+    }
+    _window = window - 1;
+    return true;
+  }
+
+  /// An item counted by [_take] was not sent after all.
+  void _untake() {
+    _window = _window! + 1;
+  }
+
+  /// Queues [queued] behind what waits for the window.
+  void _enqueue(_Queued queued) {
+    (_queue ??= Queue<_Queued>()).add(queued);
+    _armCredit();
+  }
+
+  /// Sends what waits for the window, in order, while it has room.
+  void _flush() {
+    final queue = _queue;
+    if (queue == null || _flushing) {
+      return;
+    }
+    _flushing = true;
+    try {
+      while (queue.isNotEmpty && !_finished) {
+        final head = queue.first;
+        if (head.counts && _window == 0) {
+          break;
+        }
+        queue.removeFirst();
+        _sendQueued(head);
+      }
+    } finally {
+      _flushing = false;
+    }
+  }
+
+  /// Sends [queued], counted against the window if it is an item; a send
+  /// that fails drops it with the failure.
+  void _sendQueued(_Queued queued) {
+    final took = queued.counts && _take();
+    try {
+      queued.send();
+    } catch (e, st) {
+      if (took) {
+        _untake();
+      }
+      final SwitchboardException error;
+      if (e is SwitchboardException) {
+        error = e;
+      } else {
+        _log.warning('reply to request $requestId not sent', e, st);
+        error = SwitchboardException.of(StatusCode.internal, '$e');
+      }
+      queued.drop(error);
+    }
+  }
+
+  /// Drops what waits for the window: the request ended before it could
+  /// go.
+  void _dropQueue(SwitchboardException error) {
+    final queue = _queue;
+    if (queue == null || queue.isEmpty) {
+      return;
+    }
+    final dropped = List.of(queue);
+    queue.clear();
+    _finalQueued = false;
+    for (final queued in dropped) {
+      try {
+        queued.drop(error);
+      } catch (e, st) {
+        _log.severe('dropping a reply to request $requestId failed', e, st);
+      }
+    }
+  }
+
+  /// The peer granted [items] more items of the window. Returns the reason
+  /// it is a channel protocol error, or null: a credit for a request that
+  /// is not a stream request, for an unlimited window, or that would bring
+  /// the window to [TalkFrame.unlimitedWindow] or beyond.
+  String? _onCredit(int items) {
+    if (!expectsStream) {
+      return 'credit for request $requestId, not a stream request';
+    }
+    final window = _window;
+    if (window == null) {
+      return 'credit for request $requestId, whose window is unlimited';
+    }
+    if (window + items >= TalkFrame.unlimitedWindow) {
+      return 'credit of $items items for request $requestId overflows its '
+          'window ($window left)';
+    }
+    _window = window + items;
+    _awaitingGrant = false;
+    // The wait for a grant ended; a new one starts afresh.
+    _stopCredit();
+    if (window == 0) {
+      // The responder timeout restarts, as a reply would.
+      final expiry = _expiry;
+      if (expiry != null && !_finished) {
+        expiry.reply(monotonicNow());
+      }
+    }
+    // What waits goes first, in its order, before anything the credit lets
+    // a forwarded request's responder send.
+    _flush();
+    final hook = _creditHook;
+    if (hook != null) {
+      final owed = items < _creditOwed ? items : _creditOwed;
+      _creditOwed -= owed;
+      if (items > owed) {
+        try {
+          hook(items - owed);
+        } catch (e, st) {
+          _log.severe(
+            'forwarding a credit of request $requestId failed',
+            e,
+            st,
+          );
+        }
+      }
+    }
+    _notifyCredit();
+    _arm();
+    _armCredit();
+    return null;
+  }
+
+  /// Completes [whenCredit] once the window has room, or the request
+  /// ended.
+  void _notifyCredit() {
+    final waiter = _creditWaiter;
+    if (waiter != null && (_window != 0 || _finished || _cancelled)) {
+      _creditWaiter = null;
+      waiter.complete();
+    }
+  }
+
+  /// Runs the credit bound while the window is exhausted and this side has
+  /// something to send (a reply waiting, [whenCredit] waited for), or the
+  /// request opened with window 0 has had no grant yet; stops it
+  /// otherwise. Once running, it keeps the time the wait began.
+  void _armCredit() {
+    final wanted =
+        !_finished &&
+        !_timerDeferred &&
+        _window == 0 &&
+        (_awaitingGrant ||
+            (_queue?.isNotEmpty ?? false) ||
+            _creditWaiter != null);
+    if (!wanted) {
+      _stopCredit();
+      return;
+    }
+    if (_creditEnd != null) {
+      return;
+    }
+    final bound = _creditTimeout ?? channel.options.creditTimeout;
+    if (bound <= Duration.zero) {
+      return;
+    }
+    _creditEnd = monotonicNow() + bound;
+    _armCreditTimer();
+  }
+
+  void _armCreditTimer() {
+    _creditTimer?.cancel();
+    var left = _creditEnd! - monotonicNow();
+    if (left.isNegative) {
+      left = Duration.zero;
+    }
+    _creditTimer = left > _maxTimerDelay
+        ? Timer(_maxTimerDelay, _armCreditTimer)
+        : Timer(left, _onCreditTimeout);
+  }
+
+  void _stopCredit() {
+    _creditTimer?.cancel();
+    _creditTimer = null;
+    _creditEnd = null;
+  }
+
+  void _onCreditTimeout() {
+    _creditTimer = null;
+    _creditEnd = null;
+    if (_finished) {
+      return;
+    }
+    final bound = _creditTimeout ?? channel.options.creditTimeout;
+    _log.fine('no credit for request $requestId within $bound, aborting');
+    _abortQuietly(
+      Status.of(StatusCode.deadlineExceeded, 'no credit within $bound'),
+    );
+    _markCancelled();
+  }
 
   void _check({bool item = false}) {
     if (!expectsReply) {
@@ -3444,7 +3991,7 @@ class _Message extends TalkMessage {
         'channel closed',
       );
     }
-    if (_finished || _finalizing) {
+    if (_finished || _finalizing || _finalQueued) {
       throw SwitchboardException.of(
         StatusCode.failedPrecondition,
         'request $requestId already answered',
@@ -3531,14 +4078,15 @@ class _Message extends TalkMessage {
     void Function()? onAccepted,
   }) {
     _check();
-    return _sendReply(
+    final frame = TalkFrame(
+      kind: TalkKind.message,
+      procedure: procedure,
+      responseId: requestId,
+      payload: payload,
+    );
+    Future<void> send() => _sendReply(
       () => channel._sendFrame(
-        TalkFrame(
-          kind: TalkKind.message,
-          procedure: procedure,
-          responseId: requestId,
-          payload: payload,
-        ),
+        frame,
         bulk: bulk,
         onBulk: (out) {
           out.track(_bulkOuts);
@@ -3549,6 +4097,29 @@ class _Message extends TalkMessage {
       ),
       isFinal: true,
     );
+    if (_queue?.isEmpty ?? true) {
+      return send();
+    }
+    // Never counted, but it goes after the items before it.
+    _finalQueued = true;
+    final sent = Completer<void>();
+    _enqueue(
+      _Queued(
+        counts: false,
+        send: () {
+          _finalQueued = false;
+          sent.complete(send());
+        },
+        drop: (error) {
+          _finalQueued = false;
+          // Never sent: what [onAccepted] gives back is not held for it.
+          onAccepted?.call();
+          onFailure?.call(error);
+          sent.completeError(error);
+        },
+      ),
+    );
+    return TalkChannel._quiet(sent.future, frame);
   }
 
   @override
@@ -3588,11 +4159,13 @@ class _Message extends TalkMessage {
     Duration? timeout,
     void Function(Duration? deadline, Duration? renew)? onExtend,
     Name? name,
+    int? window,
   }) => _TalkStream(
     _startReplyRequest(
       payload,
       _name(procedure, name),
       stream: true,
+      window: TalkChannel.windowOf(window),
       timeout: timeout,
       onExtend: onExtend,
     ),
@@ -3603,31 +4176,54 @@ class _Message extends TalkMessage {
     Name? procedure, {
     required bool stream,
     required Duration? timeout,
+    int window = TalkFrame.unlimitedWindow,
     void Function(Duration? deadline, Duration? renew)? onExtend,
     _ResponseSink? sink,
     _BulkSource? bulk,
     void Function()? onAccepted,
   }) {
     _check();
-    return _sendReply(
-      () => channel._startRequest(
+    _Outgoing start({bool deferred = false}) => channel._startRequest(
+      stream: stream,
+      window: window,
+      timeout: timeout,
+      onExtend: onExtend,
+      sink: sink,
+      bulk: bulk,
+      onAccepted: onAccepted,
+      deferred: deferred,
+      build: (id, window) => TalkFrame(
+        kind: TalkKind.message,
+        procedure: procedure,
+        requestId: id,
+        responseId: requestId,
         stream: stream,
-        timeout: timeout,
-        onExtend: onExtend,
-        sink: sink,
-        bulk: bulk,
-        onAccepted: onAccepted,
-        build: (id) => TalkFrame(
-          kind: TalkKind.message,
-          procedure: procedure,
-          requestId: id,
-          responseId: requestId,
-          stream: stream,
-          payload: payload,
-        ),
+        window: window,
+        payload: payload,
       ),
-      isFinal: true,
     );
+    if (_queue?.isEmpty ?? true) {
+      return _sendReply(start, isFinal: true);
+    }
+    // Never counted, but it goes after the items before it; its handle is
+    // there at once.
+    final pending = start(deferred: true);
+    _finalQueued = true;
+    _enqueue(
+      _Queued(
+        counts: false,
+        send: () {
+          _finalQueued = false;
+          _sendReply(pending.send!, isFinal: true);
+        },
+        drop: (error) {
+          _finalQueued = false;
+          onAccepted?.call();
+          channel._dropOutgoing(pending, error);
+        },
+      ),
+    );
+    return pending;
   }
 
   @override
@@ -3653,6 +4249,12 @@ class _Message extends TalkMessage {
     return sent.done;
   }
 
+  /// Sends one stream item. With [windowed] (the reply API) it waits for
+  /// the item window: queued, nothing on the wire, while the window is
+  /// exhausted or other replies wait before it. Without (an item
+  /// [forwardMessage] relays), it goes at once, counted if the window has
+  /// room: an intermediary keeps no window of its own, the far responder
+  /// keeps the requester's.
   Future<void> _replyItem(
     Uint8List payload,
     Name? procedure, {
@@ -3660,29 +4262,58 @@ class _Message extends TalkMessage {
     void Function(_BulkOut out)? onBulk,
     void Function(SwitchboardException error)? onFailure,
     void Function()? onAccepted,
+    bool windowed = true,
   }) {
     _check(item: true);
-    final sent = _sendReply(
-      () => channel._sendFrame(
-        TalkFrame(
-          kind: TalkKind.streamItem,
-          procedure: procedure,
-          responseId: requestId,
-          payload: payload,
+    final frame = TalkFrame(
+      kind: TalkKind.streamItem,
+      procedure: procedure,
+      responseId: requestId,
+      payload: payload,
+    );
+    Future<void> send() {
+      final sent = _sendReply(
+        () => channel._sendFrame(
+          frame,
+          bulk: bulk,
+          onBulk: (out) {
+            out.track(_bulkOuts);
+            // An item's payload going out is progress, as the item was.
+            out.onProgress = _replied;
+            onBulk?.call(out);
+          },
+          onFailure: onFailure,
+          onAccepted: onAccepted,
         ),
-        bulk: bulk,
-        onBulk: (out) {
-          out.track(_bulkOuts);
-          // An item's payload going out is progress, as the item was.
-          out.onProgress = _replied;
-          onBulk?.call(out);
+      );
+      _replied();
+      return sent;
+    }
+
+    if (!windowed || _itemCanGo) {
+      final took = _take();
+      try {
+        return send();
+      } catch (_) {
+        if (took) {
+          _untake();
+        }
+        rethrow;
+      }
+    }
+    final sent = Completer<void>();
+    _enqueue(
+      _Queued(
+        counts: true,
+        send: () => sent.complete(send()),
+        drop: (error) {
+          onAccepted?.call();
+          onFailure?.call(error);
+          sent.completeError(error);
         },
-        onFailure: onFailure,
-        onAccepted: onAccepted,
       ),
     );
-    _replied();
-    return sent;
+    return TalkChannel._quiet(sent.future, frame);
   }
 
   @override
@@ -3722,46 +4353,80 @@ class _Message extends TalkMessage {
     Duration? timeout,
     void Function(Duration? deadline, Duration? renew)? onExtend,
     Name? name,
+    int? window,
   }) => _TalkStream(
     _startItemRequest(
       payload,
       _name(procedure, name),
       stream: true,
+      window: TalkChannel.windowOf(window),
       timeout: timeout,
       onExtend: onExtend,
     ),
   );
 
+  /// Sends one stream item that is itself a request, waiting for the item
+  /// window as [_replyItem] does: queued, its request registered (its
+  /// handle is returned at once) but not sent.
   _Outgoing _startItemRequest(
     Uint8List payload,
     Name? procedure, {
     required bool stream,
     required Duration? timeout,
+    int window = TalkFrame.unlimitedWindow,
     void Function(Duration? deadline, Duration? renew)? onExtend,
     _ResponseSink? sink,
     _BulkSource? bulk,
     void Function()? onAccepted,
+    bool windowed = true,
   }) {
     _check(item: true);
-    final pending = _sendReply(
-      () => channel._startRequest(
+    _Outgoing start({bool deferred = false}) => channel._startRequest(
+      stream: stream,
+      window: window,
+      timeout: timeout,
+      onExtend: onExtend,
+      sink: sink,
+      bulk: bulk,
+      onAccepted: onAccepted,
+      deferred: deferred,
+      build: (id, window) => TalkFrame(
+        kind: TalkKind.streamItem,
+        procedure: procedure,
+        requestId: id,
+        responseId: requestId,
         stream: stream,
-        timeout: timeout,
-        onExtend: onExtend,
-        sink: sink,
-        bulk: bulk,
-        onAccepted: onAccepted,
-        build: (id) => TalkFrame(
-          kind: TalkKind.streamItem,
-          procedure: procedure,
-          requestId: id,
-          responseId: requestId,
-          stream: stream,
-          payload: payload,
-        ),
+        window: window,
+        payload: payload,
       ),
     );
-    _replied();
+    if (!windowed || _itemCanGo) {
+      final took = _take();
+      try {
+        final pending = _sendReply(start);
+        _replied();
+        return pending;
+      } catch (_) {
+        if (took) {
+          _untake();
+        }
+        rethrow;
+      }
+    }
+    final pending = start(deferred: true);
+    _enqueue(
+      _Queued(
+        counts: true,
+        send: () {
+          _sendReply(pending.send!);
+          _replied();
+        },
+        drop: (error) {
+          onAccepted?.call();
+          channel._dropOutgoing(pending, error);
+        },
+      ),
+    );
     return pending;
   }
 
@@ -3773,6 +4438,7 @@ class _Message extends TalkMessage {
 
   Future<void> _replyAbort(Status status) {
     _check();
+    _dropError ??= SwitchboardException(status);
     return _sendReply(
       () => channel._sendChecked(
         TalkFrame(
@@ -3890,7 +4556,9 @@ class _Message extends TalkMessage {
   Duration? _armedEnd;
 
   void _arm() {
-    final end = _expiry?.end;
+    // While the item window is exhausted the responder timeout does not
+    // run: the credit bound does ([_armCredit]).
+    final end = _finished || _window == 0 ? null : _expiry?.end;
     if (end != null && end == _armedEnd && _timer != null) {
       return;
     }
@@ -3931,15 +4599,18 @@ class _Message extends TalkMessage {
     if (_finished || _finalizing || !expectsReply) {
       return;
     }
+    _dropError ??= SwitchboardException(status);
     _sendReply(() => channel._rejectRequest(requestId, status), isFinal: true);
   }
 
   /// The listener this request was delivered to threw before answering it:
   /// answers `ABORT INTERNAL` on its behalf and, as on the responder
   /// timeout, marks the request cancelled, so that work started on it (a
-  /// [forwardMessage] of it included) stops.
+  /// [forwardMessage] of it included) stops. A final reply made before it
+  /// threw answered it, also one that waits behind items for the item
+  /// window ([_finalQueued]).
   void _handlerFailed() {
-    if (_finished || _finalizing || !expectsReply) {
+    if (_finished || _finalizing || _finalQueued || !expectsReply) {
       return;
     }
     _abortQuietly(Status.of(StatusCode.internal, 'message handler failed'));
@@ -3962,9 +4633,19 @@ class _Message extends TalkMessage {
     _finished = true;
     _timer?.cancel();
     _timer = null;
+    _stopCredit();
     channel._release(this);
     // Answered: a payload the application did not read is not needed.
     _bulk?.abandon();
+    // An abort went before what waited for the window.
+    _dropQueue(
+      _dropError ??
+          SwitchboardException.of(
+            StatusCode.failedPrecondition,
+            'request $requestId ended before the reply was sent',
+          ),
+    );
+    _notifyCredit();
   }
 
   void _markCancelled([Status? status]) {
@@ -3985,6 +4666,7 @@ class _Message extends TalkMessage {
       out.cancel(cancelled);
     }
     (_cancelCompleter ??= Completer<void>()).complete();
+    _notifyCredit();
     final hook = _cancelHook;
     _cancelHook = null;
     if (hook != null) {
@@ -3996,11 +4678,20 @@ class _Message extends TalkMessage {
     }
   }
 
-  /// The request can no longer be answered (channel closed or id reused).
-  void _abandon() {
+  /// The request can no longer be answered (channel closed or id reused):
+  /// what waits for the window fails with [error].
+  void _abandon([SwitchboardException? error]) {
     _finished = true;
     _timer?.cancel();
     _timer = null;
+    _stopCredit();
+    _dropQueue(
+      error ??
+          SwitchboardException.of(
+            StatusCode.failedPrecondition,
+            'request $requestId can no longer be answered',
+          ),
+    );
     _markCancelled();
   }
 }
@@ -4137,6 +4828,22 @@ class _Held {
 
   /// The controller delivers nothing more; its credit went back.
   bool drained = false;
+}
+
+/// A reply waiting for the item window of the request it answers
+/// ([_Message._queue]).
+class _Queued {
+  _Queued({required this.counts, required this.send, required this.drop});
+
+  /// A stream item: it takes one item of the window, and waits for one.
+  final bool counts;
+
+  /// Sends the reply; throws what sending throws.
+  final void Function() send;
+
+  /// The reply will not be sent: the request ended, or sending it failed
+  /// with [error].
+  final void Function(SwitchboardException error) drop;
 }
 
 /// A frame waiting for the peer's LIMITS ([TalkChannel._sendFrame]): sent
