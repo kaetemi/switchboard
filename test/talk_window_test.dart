@@ -1164,6 +1164,50 @@ void main() {
       await requests.cancel();
     });
 
+    test('over a synchronous transport, a cancel sent as the first granted '
+        'item arrives is answered after the items granted, and drops the '
+        'rest', () async {
+      final c = StreamChannelController<Uint8List>(sync: true);
+      final talk = TalkChannel(c.local);
+      final sent = <TalkFrame>[];
+      c.foreign.stream.listen((data) {
+        final frame = TalkFrame.decode(data);
+        sent.add(frame);
+        if (frame.kind == TalkKind.streamItem && sent.length == 1) {
+          // Delivered once the credit that let the item go was handled:
+          // a subscription does not re-enter its listener.
+          c.foreign.sink.add(
+            TalkFrame(
+              kind: TalkKind.abort,
+              requestId: 1,
+              payload: Status.of(StatusCode.cancelled).encode(),
+            ).encode(),
+          );
+        }
+      });
+      final held = Completer<TalkMessage>();
+      talk.messages.listen(held.complete);
+      c.foreign.sink.add(streamRequestFrame(1, 0).encode());
+      final m = await held.future;
+      final replies = [
+        for (var i = 0; i < 3; i++) Outcome(m.replyItem(bytes([i]))),
+      ];
+      c.foreign.sink.add(credit(1, 2).encode());
+      await pumpEventQueue();
+      expect(sent.map((f) => f.kind), [
+        TalkKind.streamItem,
+        TalkKind.streamItem,
+        TalkKind.abort,
+      ]);
+      expect(sent.last.status.known, StatusCode.cancelled);
+      expect(replies[0].isDone && replies[0].error == null, isTrue);
+      expect(replies[1].isDone && replies[1].error == null, isTrue);
+      expect(replies[2].error, isStatus(StatusCode.cancelled));
+      expect(m.isCancelled, isTrue);
+      expect(talk.incomingRequestCount, 0);
+      await talk.close();
+    });
+
     test('a bulk item counts as one item', () async {
       final (client, server) = muxPair();
       final accepted = StreamController<TalkChannel>();

@@ -1377,7 +1377,7 @@ class TalkChannel {
   /// [deferred] the request is registered and its handle returned, but
   /// nothing is sent until [_Outgoing.send] is called (an item request or
   /// a chained final waiting for the item window of the request it
-  /// answers, see [_Message._sendWindowed]).
+  /// answers, see [_Message._queue]).
   _Outgoing _startRequest({
     required bool stream,
     required Duration? timeout,
