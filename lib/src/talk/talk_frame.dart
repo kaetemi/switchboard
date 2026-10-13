@@ -27,9 +27,12 @@ enum TalkKind {
   /// Kind 2: abort response, cancel, or channel abort, by the ids present.
   abort,
 
-  /// Kind 3: response timeout extension: a deadline and a renewal declared
-  /// by the responder, or, empty, a restart of the requester's default
-  /// timeout.
+  /// Kind 3: control of an outstanding request, by either side. From the
+  /// responder (a response id): a response timeout extension, a deadline
+  /// and a renewal it declares, or, empty, a restart of the requester's
+  /// default timeout. From the requester (a request id of its own): a
+  /// credit, more items of the item window of its stream request
+  /// ([TalkFrame.isCredit]).
   extend,
 }
 
@@ -39,7 +42,8 @@ enum TalkKind {
 /// a valid id on the wire). A null [procedure] means the procedure field is
 /// absent, which receivers treat as the all-zero name. With [bulk] the
 /// payload field is a [TalkBulkReference] to a bulk channel carrying the
-/// payload (see [TalkBulkReference]).
+/// payload (see [TalkBulkReference]). A stream request ([stream]) carries
+/// its item [window] after the ids.
 ///
 /// See the wiki page "Polyverse Switchboard Talk" for the layout and the flag rules.
 class TalkFrame {
@@ -50,6 +54,7 @@ class TalkFrame {
     this.requestId = 0,
     this.responseId = 0,
     this.stream = false,
+    this.window = unlimitedWindow,
     this.bulk = false,
     Uint8List? payload,
   }) : payload = payload ?? _emptyPayload;
@@ -63,7 +68,8 @@ class TalkFrame {
   /// Flag bit: a response id follows; this responds to the peer's request.
   static const int flagHasResponse = 0x04;
 
-  /// Flag bit: with [flagHasRequest], the sender accepts stream items.
+  /// Flag bit: with [flagHasRequest], the sender accepts stream items, and
+  /// a `u32` item window follows the ids ([window]).
   static const int flagStream = 0x08;
 
   /// Mask of the kind field.
@@ -87,6 +93,14 @@ class TalkFrame {
   /// Largest value of an `EXTEND` field, in milliseconds (`u32`).
   static const int maxExtendMillis = 0xFFFFFFFF;
 
+  /// The item [window] of a stream request that takes any number of items:
+  /// no accounting, the channel's flow control alone bounds the stream.
+  /// Finite windows are 0 to `unlimitedWindow - 1`.
+  static const int unlimitedWindow = 0xFFFFFFFF;
+
+  /// Length of a credit's payload ([isCredit]): `u32 items`.
+  static const int creditPayloadLength = 4;
+
   static final Uint8List _emptyPayload = Uint8List(0);
 
   /// Message kind.
@@ -103,6 +117,14 @@ class TalkFrame {
 
   /// The `STREAM` flag: the sender accepts `STREAM_ITEM` responses.
   final bool stream;
+
+  /// The item window of a stream request ([stream]): how many
+  /// `STREAM_ITEM`s the requester is ready to take before it grants more
+  /// with a credit ([isCredit]), 0 for none until a grant, or
+  /// [unlimitedWindow]. On the wire only with [stream]; any other frame
+  /// keeps the default, [unlimitedWindow]. See the wiki page "Polyverse
+  /// Switchboard Talk", section "Item windows".
+  final int window;
 
   /// The `BULK` flag: [payload] is a [TalkBulkReference], and the payload
   /// itself travels on the bulk channel it names.
@@ -129,6 +151,7 @@ class TalkFrame {
     requestId: requestId,
     responseId: responseId,
     stream: stream,
+    window: window,
     bulk: true,
     payload: reference.encode(),
   );
@@ -138,6 +161,31 @@ class TalkFrame {
 
   /// True when [responseId] is present.
   bool get hasResponse => responseId != 0;
+
+  /// True for a credit: an `EXTEND` from the requester ([requestId], its own
+  /// stream request), granting the responder [creditItems] more items of
+  /// that request's item window.
+  bool get isCredit => kind == TalkKind.extend && hasRequest;
+
+  /// The number of items a credit ([isCredit]) grants, at least 1. Throws
+  /// [StateError] for any other frame.
+  int get creditItems {
+    if (!isCredit) {
+      throw StateError('only credits carry an item count');
+    }
+    return ByteData.sublistView(payload).getUint32(0, Endian.little);
+  }
+
+  /// The payload of a credit granting [items] more items (`u32`, little
+  /// endian). Throws [ArgumentError] unless [items] is 1 to 0xFFFFFFFF.
+  static Uint8List creditPayload(int items) {
+    if (items < 1 || items > 0xFFFFFFFF) {
+      throw ArgumentError.value(items, 'items', 'must be 1 to 0xFFFFFFFF');
+    }
+    final out = Uint8List(creditPayloadLength);
+    ByteData.sublistView(out).setUint32(0, items, Endian.little);
+    return out;
+  }
 
   /// The flags byte this frame encodes to.
   int get flags =>
@@ -162,14 +210,17 @@ class TalkFrame {
     return Status.decode(payload);
   }
 
-  /// The values carried by an [TalkKind.extend] frame: the deadline and the
-  /// renewal the responder declares, each null when the field is 0
-  /// ("unchanged"). Both are null for an empty payload, which restarts the
-  /// requester's default timeout; [payload] tells the two apart. Throws
-  /// [StateError] for other kinds.
+  /// The values carried by an [TalkKind.extend] frame from the responder:
+  /// the deadline and the renewal it declares, each null when the field is
+  /// 0 ("unchanged"). Both are null for an empty payload, which restarts
+  /// the requester's default timeout; [payload] tells the two apart. Throws
+  /// [StateError] for other kinds, and for a credit ([isCredit]).
   ({Duration? deadline, Duration? renew}) get extension {
     if (kind != TalkKind.extend) {
       throw StateError('only EXTEND frames carry an extension');
+    }
+    if (hasRequest) {
+      throw StateError('a credit carries no extension');
     }
     if (payload.isEmpty) {
       return (deadline: null, renew: null);
@@ -224,6 +275,12 @@ class TalkFrame {
     if (responseId < 0 || responseId > maxId) {
       throw ArgumentError.value(responseId, 'responseId', 'must fit in u24');
     }
+    if (window < 0 || window > unlimitedWindow) {
+      throw ArgumentError.value(window, 'window', 'must fit in u32');
+    }
+    if (!stream && window != unlimitedWindow) {
+      throw ArgumentError.value(window, 'window', 'without STREAM');
+    }
     final error = _ruleViolation(
       kind: kind,
       hasProcedure: procedure != null,
@@ -235,6 +292,9 @@ class TalkFrame {
     );
     if (error != null) {
       throw ArgumentError(error);
+    }
+    if (isCredit && creditItems == 0) {
+      throw ArgumentError('credit of 0 items');
     }
     if (bulk) {
       try {
@@ -248,6 +308,7 @@ class TalkFrame {
         (procedure != null ? Name.byteLength : 0) +
         (hasRequest ? 3 : 0) +
         (hasResponse ? 3 : 0) +
+        (stream ? 4 : 0) +
         payload.length;
     final out = Uint8List(length);
     out[0] = flags;
@@ -267,18 +328,24 @@ class TalkFrame {
       out[offset++] = (responseId >> 8) & 0xFF;
       out[offset++] = (responseId >> 16) & 0xFF;
     }
+    if (stream) {
+      ByteData.sublistView(out).setUint32(offset, window, Endian.little);
+      offset += 4;
+    }
     out.setRange(offset, length, payload);
     return out;
   }
 
   /// Decodes one Talk message.
   ///
-  /// Throws [ProtocolException] for a truncated header, the reserved bit,
-  /// an invalid flag combination, an invalid procedure name, or a violation
-  /// of the kind rules (an `EXTEND` payload that is neither empty nor
-  /// [extendPayloadLength] bytes long among them, `BULK` on an `ABORT` or
-  /// an `EXTEND`, and a bulk reference that is not a valid
-  /// [TalkBulkReference]).
+  /// Throws [ProtocolException] for a truncated header (a stream request
+  /// without its item window among them), the reserved bit, an invalid
+  /// flag combination, an invalid procedure name, or a violation of the
+  /// kind rules (an `EXTEND` with both ids or neither, an extend payload
+  /// that is neither empty nor [extendPayloadLength] bytes long, a credit
+  /// payload that is not [creditPayloadLength] bytes long or grants 0
+  /// items, `BULK` on an `ABORT` or an `EXTEND`, and a bulk reference that
+  /// is not a valid [TalkBulkReference] among them).
   static TalkFrame decode(Uint8List bytes) {
     final reader = ByteReader(bytes);
     try {
@@ -303,6 +370,11 @@ class TalkFrame {
       if (hasResponse && responseId == 0) {
         throw ProtocolException('response id 0');
       }
+      final streamError = _streamViolation(kind, hasRequest);
+      if (stream && streamError != null) {
+        throw ProtocolException(streamError);
+      }
+      final window = stream ? reader.u32('item window') : unlimitedWindow;
       final payload = reader.rest();
       final error = _ruleViolation(
         kind: kind,
@@ -319,15 +391,20 @@ class TalkFrame {
       if (bulk) {
         TalkBulkReference.decode(payload);
       }
-      return TalkFrame(
+      final frame = TalkFrame(
         kind: kind,
         procedure: procedure,
         requestId: requestId,
         responseId: responseId,
         stream: stream,
+        window: window,
         bulk: bulk,
         payload: payload,
       );
+      if (frame.isCredit && frame.creditItems == 0) {
+        throw ProtocolException('credit of 0 items');
+      }
+      return frame;
     } on FormatException catch (e) {
       throw ProtocolException(e.message);
     }
@@ -345,8 +422,11 @@ class TalkFrame {
     required bool bulk,
     required int payloadLength,
   }) {
-    if (stream && !hasRequest) {
-      return 'STREAM without HAS_REQUEST';
+    if (stream) {
+      final error = _streamViolation(kind, hasRequest);
+      if (error != null) {
+        return error;
+      }
     }
     if (bulk) {
       if (kind == TalkKind.abort || kind == TalkKind.extend) {
@@ -375,15 +455,33 @@ class TalkFrame {
           return 'ABORT payload is not a status';
         }
       case TalkKind.extend:
-        if (!hasResponse) {
-          return 'EXTEND without HAS_RESPONSE';
+        if (hasRequest && hasResponse) {
+          return 'EXTEND with both request and response id';
+        }
+        if (!hasRequest && !hasResponse) {
+          return 'EXTEND without an id';
         }
         if (hasRequest) {
-          return 'EXTEND with HAS_REQUEST';
-        }
-        if (payloadLength != 0 && payloadLength != extendPayloadLength) {
+          if (payloadLength != creditPayloadLength) {
+            return 'credit payload of $payloadLength bytes';
+          }
+        } else if (payloadLength != 0 && payloadLength != extendPayloadLength) {
           return 'EXTEND payload of $payloadLength bytes';
         }
+    }
+    return null;
+  }
+
+  /// Where the `STREAM` flag may not be: without a request id, and on an
+  /// `ABORT` or an `EXTEND`, whose request id names an outstanding request
+  /// (a cancel, a credit) instead of opening one. Returns a description of
+  /// the violation, or null.
+  static String? _streamViolation(TalkKind kind, bool hasRequest) {
+    if (!hasRequest) {
+      return 'STREAM without HAS_REQUEST';
+    }
+    if (kind == TalkKind.abort || kind == TalkKind.extend) {
+      return 'STREAM on ${kind == TalkKind.abort ? 'ABORT' : 'EXTEND'}';
     }
     return null;
   }
@@ -396,6 +494,7 @@ class TalkFrame {
         other.requestId != requestId ||
         other.responseId != responseId ||
         other.stream != stream ||
+        other.window != window ||
         other.bulk != bulk ||
         other.payload.length != payload.length) {
       return false;
@@ -415,6 +514,7 @@ class TalkFrame {
     requestId,
     responseId,
     stream,
+    window,
     bulk,
     payload.length,
   );
@@ -432,7 +532,9 @@ class TalkFrame {
       parts.add('resp=$responseId');
     }
     if (stream) {
-      parts.add('stream');
+      parts.add(
+        window == unlimitedWindow ? 'stream' : 'stream, window=$window',
+      );
     }
     if (bulk) {
       parts.add('bulk');

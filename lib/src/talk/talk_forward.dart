@@ -23,6 +23,15 @@ part of 'talk_channel.dart';
 /// * stream items and `EXTEND`s are passed on as they arrive, an `EXTEND`
 ///   with its payload unchanged (the deadline and renewal the far
 ///   responder declared, whose buffer covers the hops);
+/// * a stream request keeps its item window: forwarded with the window
+///   [incoming] has left (the one it opened with, and the credits that
+///   arrived for it before it was forwarded), and every credit the
+///   requester grants afterwards is forwarded as a credit for the
+///   forwarded request, the same way for stream requests nested in
+///   replies. The intermediary grants nothing of its own and keeps no
+///   window: what the far responder sends is relayed at once, so the
+///   requester's window bounds the far responder end to end (wiki page
+///   "Polyverse Switchboard Talk", "Item windows");
 /// * the final response is passed on as the final reply, with its trailing
 ///   payload;
 /// * an item or final response that is itself a request is forwarded the
@@ -47,9 +56,10 @@ part of 'talk_channel.dart';
 /// stays absent (a request forwarded without one gets the empty name).
 ///
 /// The intermediary imposes no timeouts of its own: the responder timeout
-/// of every forwarded request is disabled ([TalkMessage.setReplyTimeout])
-/// and the requests it sends have no requester timeout, so the timeouts of
-/// the two real peers apply end to end, with `EXTEND` forwarded.
+/// and the credit bound of every forwarded request are disabled
+/// ([TalkMessage.setReplyTimeout], [TalkMessage.setCreditTimeout]) and the
+/// requests it sends have no requester timeout, so the timeouts of the two
+/// real peers apply end to end, with `EXTEND` forwarded.
 ///
 /// Flow control passes through hop by hop (wiki page "Switchboard
 /// Proxying"): over mux channels, the credit of a frame that is forwarded
@@ -121,15 +131,17 @@ Future<void> forwardMessage(TalkMessage incoming, TalkChannel target) {
     final (payload, bulk) = incoming._forwardPayload();
     return target._startRequest(
       stream: stream,
+      window: incoming._window ?? TalkFrame.unlimitedWindow,
       timeout: Duration.zero,
       sink: relay,
       bulk: bulk,
       onAccepted: accepted,
-      build: (id) => TalkFrame(
+      build: (id, window) => TalkFrame(
         kind: TalkKind.message,
         procedure: procedure,
         requestId: id,
         stream: stream,
+        window: window,
         payload: payload,
       ),
     );
@@ -155,6 +167,10 @@ class _Relay implements _ResponseSink {
 
   /// Cancellation requested while the forwarded request was being sent.
   Status? _cancelWhenSent;
+
+  /// Credits granted for [incoming] while the forwarded request was being
+  /// sent, forwarded once it was.
+  int _creditWhenSent = 0;
 
   /// The forwarded request ended.
   bool _ended = false;
@@ -187,9 +203,13 @@ class _Relay implements _ResponseSink {
       return relay._done.future;
     }
     incoming._forwarded = true;
-    // The far requester's own timeout applies; EXTEND is forwarded.
-    incoming.setReplyTimeout(Duration.zero);
-    incoming._cancelHook = relay._onIncomingCancelled;
+    // The far requester's own timeout applies; EXTEND is forwarded. So
+    // does the far responder's credit bound; credits are forwarded.
+    incoming
+      ..setReplyTimeout(Duration.zero)
+      ..setCreditTimeout(Duration.zero)
+      .._cancelHook = relay._onIncomingCancelled
+      .._creditHook = relay._onIncomingCredit;
     final accepted = incoming._takeCredit();
     try {
       relay._out = send(relay, accepted);
@@ -209,6 +229,12 @@ class _Relay implements _ResponseSink {
       relay._starting = false;
       relay._checkDone();
     }
+    final credit = relay._creditWhenSent;
+    final out = relay._out;
+    if (credit > 0 && out != null) {
+      relay._creditWhenSent = 0;
+      out.forwardCredit(credit);
+    }
     final cancel = relay._cancelWhenSent;
     if (cancel != null) {
       relay._cancelOutgoing(cancel);
@@ -227,7 +253,9 @@ class _Relay implements _ResponseSink {
       return;
     }
     _ended = true;
-    incoming._cancelHook = null;
+    incoming
+      .._cancelHook = null
+      .._creditHook = null;
     _checkDone();
   }
 
@@ -258,6 +286,17 @@ class _Relay implements _ResponseSink {
   void _onIncomingCancelled() => _cancelOutgoing(
     incoming._cancelStatus ?? Status.of(StatusCode.cancelled),
   );
+
+  /// The requester granted [items] more items of [incoming]: a credit for
+  /// the forwarded request, granting nothing of the intermediary's own.
+  void _onIncomingCredit(int items) {
+    final out = _out;
+    if (out == null) {
+      _creditWhenSent += items;
+      return;
+    }
+    out.forwardCredit(items);
+  }
 
   void _cancelOutgoing(Status status) {
     final out = _out;
@@ -311,6 +350,7 @@ class _Relay implements _ResponseSink {
           item.frame.procedure,
           bulk: bulk,
           onAccepted: accepted,
+          windowed: false,
         );
       });
       return;
@@ -328,10 +368,12 @@ class _Relay implements _ResponseSink {
           payload,
           item.frame.procedure,
           stream: item.expectsStream,
+          window: item._window ?? TalkFrame.unlimitedWindow,
           timeout: Duration.zero,
           sink: relay,
           bulk: bulk,
           onAccepted: accepted,
+          windowed: false,
         );
       }),
     );
@@ -361,6 +403,7 @@ class _Relay implements _ResponseSink {
             payload,
             message.frame.procedure,
             stream: message.expectsStream,
+            window: message._window ?? TalkFrame.unlimitedWindow,
             timeout: Duration.zero,
             sink: relay,
             bulk: bulk,
