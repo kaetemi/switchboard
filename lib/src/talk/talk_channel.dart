@@ -246,9 +246,10 @@ class TalkOptions {
   /// exhausted while this side has something to send (an item waiting for
   /// a grant, a [TalkMessage.replyStream] source paused, a
   /// [TalkMessage.whenCredit] waited for), and, for a request opened with
-  /// window 0, from its arrival until the first grant. On expiry the
+  /// window 0, from its arrival (for one with a bulk payload, from its
+  /// delivery, as [replyTimeout]) until the first grant. On expiry the
   /// channel answers `ABORT DEADLINE_EXCEEDED` on the application's
-  /// behalf. While the window is exhausted the responder and requester
+  /// behalf, and what waited for the window is not sent. While the window is exhausted the responder and requester
   /// timeouts do not run: the requester is the cause of the wait, and this
   /// bounds it instead (wiki page "Polyverse Switchboard Talk", "Timeouts",
   /// "Credit"). Overridable per request with
@@ -2297,7 +2298,7 @@ class TalkChannel {
       return;
     }
     final pending = _outgoing[frame.responseId];
-    if (pending == null || pending.finalReceived) {
+    if (pending == null || !pending.awaitsResponse) {
       _credit(wire);
       _discardBulk(frame);
       _unknownResponse(frame);
@@ -2387,7 +2388,7 @@ class TalkChannel {
 
   void _onStreamItem(TalkFrame frame, int wire) {
     final pending = _outgoing[frame.responseId];
-    if (pending == null || pending.finalReceived) {
+    if (pending == null || !pending.awaitsResponse) {
       _credit(wire);
       _discardBulk(frame);
       _unknownResponse(frame);
@@ -2451,7 +2452,7 @@ class TalkChannel {
   void _onAbort(TalkFrame frame) {
     if (frame.hasResponse) {
       final pending = _outgoing[frame.responseId];
-      if (pending == null || pending.finalReceived) {
+      if (pending == null || !pending.awaitsResponse) {
         _log.fine('abort for unknown request ${frame.responseId} ignored');
         return;
       }
@@ -2513,7 +2514,7 @@ class TalkChannel {
       return;
     }
     final pending = _outgoing[frame.responseId];
-    if (pending == null || pending.abandoned || pending.finalReceived) {
+    if (pending == null || pending.abandoned || !pending.awaitsResponse) {
       _credit(wire);
       return;
     }
@@ -2998,6 +2999,13 @@ class _Outgoing {
 
   /// Answered, failed or cancelled.
   bool get ended => _failed || completer.isCompleted || abandoned;
+
+  /// Whether what the peer sends for [id] can answer this request: not
+  /// once its final arrived, nor before its frame went ([queued]), which
+  /// the peer cannot know of: what arrives for the id then is stale (for an
+  /// earlier request with the id) or invented, and is treated as for an
+  /// unknown id.
+  bool get awaitsResponse => !finalReceived && !queued;
 
   /// The window is exhausted: as many items arrived as were granted, so the
   /// requester timeout does not run (wiki page "Polyverse Switchboard
@@ -3707,6 +3715,24 @@ class _Message extends TalkMessage {
   /// this request over: passes it on.
   void Function(int items)? _creditHook;
 
+  /// Items of the window that replies of the application's own, waiting
+  /// for it when [forwardMessage] took the request over, still take: the
+  /// credits that cover them are not passed to [_creditHook], so that what
+  /// the far responder may send fits in what they leave.
+  int _creditOwed = 0;
+
+  /// The items in [_queue]: replies that wait for the window, each taking
+  /// one item of it.
+  int get _queuedItems {
+    var count = 0;
+    for (final queued in _queue ?? const <_Queued>[]) {
+      if (queued.counts) {
+        count++;
+      }
+    }
+    return count;
+  }
+
   /// Why replies still waiting for the window are not sent, when the
   /// request ends with an abort.
   SwitchboardException? _dropError;
@@ -3852,14 +3878,6 @@ class _Message extends TalkMessage {
     _awaitingGrant = false;
     // The wait for a grant ended; a new one starts afresh.
     _stopCredit();
-    final hook = _creditHook;
-    if (hook != null) {
-      try {
-        hook(items);
-      } catch (e, st) {
-        _log.severe('forwarding a credit of request $requestId failed', e, st);
-      }
-    }
     if (window == 0) {
       // The responder timeout restarts, as a reply would.
       final expiry = _expiry;
@@ -3867,7 +3885,25 @@ class _Message extends TalkMessage {
         expiry.reply(monotonicNow());
       }
     }
+    // What waits goes first, in its order, before anything the credit lets
+    // a forwarded request's responder send.
     _flush();
+    final hook = _creditHook;
+    if (hook != null) {
+      final owed = items < _creditOwed ? items : _creditOwed;
+      _creditOwed -= owed;
+      if (items > owed) {
+        try {
+          hook(items - owed);
+        } catch (e, st) {
+          _log.severe(
+            'forwarding a credit of request $requestId failed',
+            e,
+            st,
+          );
+        }
+      }
+    }
     _notifyCredit();
     _arm();
     _armCredit();
@@ -4076,6 +4112,8 @@ class _Message extends TalkMessage {
         },
         drop: (error) {
           _finalQueued = false;
+          // Never sent: what [onAccepted] gives back is not held for it.
+          onAccepted?.call();
           onFailure?.call(error);
           sent.completeError(error);
         },
@@ -4180,6 +4218,7 @@ class _Message extends TalkMessage {
         },
         drop: (error) {
           _finalQueued = false;
+          onAccepted?.call();
           channel._dropOutgoing(pending, error);
         },
       ),
@@ -4268,6 +4307,7 @@ class _Message extends TalkMessage {
         counts: true,
         send: () => sent.complete(send()),
         drop: (error) {
+          onAccepted?.call();
           onFailure?.call(error);
           sent.completeError(error);
         },
@@ -4381,7 +4421,10 @@ class _Message extends TalkMessage {
           _sendReply(pending.send!);
           _replied();
         },
-        drop: (error) => channel._dropOutgoing(pending, error),
+        drop: (error) {
+          onAccepted?.call();
+          channel._dropOutgoing(pending, error);
+        },
       ),
     );
     return pending;
@@ -4563,9 +4606,11 @@ class _Message extends TalkMessage {
   /// The listener this request was delivered to threw before answering it:
   /// answers `ABORT INTERNAL` on its behalf and, as on the responder
   /// timeout, marks the request cancelled, so that work started on it (a
-  /// [forwardMessage] of it included) stops.
+  /// [forwardMessage] of it included) stops. A final reply made before it
+  /// threw answered it, also one that waits behind items for the item
+  /// window ([_finalQueued]).
   void _handlerFailed() {
-    if (_finished || _finalizing || !expectsReply) {
+    if (_finished || _finalizing || _finalQueued || !expectsReply) {
       return;
     }
     _abortQuietly(Status.of(StatusCode.internal, 'message handler failed'));

@@ -1409,6 +1409,28 @@ void main() {
         await items.cancel();
       });
 
+      test('a reply relayed behind items of the intermediary\'s own, that '
+          'wait for the window, gives its credit back when it is dropped, '
+          '$over', () async {
+        final (frontRaw, clientRaw) = await link(slot: slot);
+        final (backRaw, backendRaw) = await link();
+        final client = TalkChannel(clientRaw);
+        final back = TalkChannel(backRaw);
+        final backend = TalkChannel(backendRaw);
+        TalkChannel(frontRaw).messages.listen((m) {
+          m.replyItem(bytes([1])).ignore();
+          forwardMessage(m, back).ignore();
+        });
+        backend.messages.listen((m) => m.reply(Uint8List(1000)));
+        final s = client.streamRequest('LIST', Uint8List(0), window: 0);
+        s.items.listen((_) {}, onError: (_) {});
+        // The final waits behind the item, its frame's credit held.
+        await until(() => heldOf(back) > 1000);
+        s.cancel();
+        await expectLater(s.done, throwsStatus(StatusCode.cancelled));
+        await until(() => heldOf(back) == 0);
+      });
+
       test('forwarded final responses withhold credit, $over', () async {
         final (client, _, back, backend) = await relay(slotFront: slot);
         backend.messages.listen((m) => m.reply(Uint8List(1000)));
@@ -1628,6 +1650,113 @@ void main() {
       expect(r.atBackend.where((f) => f.isCredit), isEmpty);
       expect(r.atBackend.last.kind, TalkKind.abort);
       await r.proxy.close();
+    });
+
+    test('an item beyond the window from the backend closes the proxy\'s '
+        'channel to it PROTOCOL_ERROR; the client is answered UNAVAILABLE '
+        'and its channel stays open', () async {
+      final r = RawProxy();
+      r.fromClient(
+        TalkFrame(
+          kind: TalkKind.message,
+          procedure: Name('LIST'),
+          requestId: 2,
+          stream: true,
+          window: 1,
+        ),
+      );
+      await pumpEventQueue();
+      final id = r.atBackend.single.requestId;
+      expect(r.atBackend.single.window, 1);
+      r
+        ..fromBackend(item(id, 1))
+        ..fromBackend(item(id, 2));
+      expect((await r.proxy.back.done).known, StatusCode.protocolError);
+      await pumpEventQueue();
+      final toClient = [
+        for (final f in r.atClient)
+          if (f.responseId == 2) f,
+      ];
+      expect(
+        [for (final f in toClient) f.kind],
+        [TalkKind.streamItem, TalkKind.abort],
+      );
+      expect(toClient.first.payload, [1]);
+      expect(toClient.last.status.known, StatusCode.unavailable);
+      expect(r.proxy.front.isOpen, isTrue);
+      expect(r.proxy.front.incomingRequestCount, 0);
+      await Future.wait(r.proxy.forwards);
+      await r.proxy.close();
+    });
+
+    test('a request forwarded while items of the intermediary\'s own wait '
+        'for its window: they take the first credits, the far responder '
+        'the rest', () async {
+      final toFront = StreamChannelController<Uint8List>();
+      final client = TalkChannel(toFront.local);
+      final front = TalkChannel(toFront.foreign);
+      // The proxy's channel to the backend, its frames recorded.
+      final atBackend = <TalkFrame>[];
+      final toBack = StreamChannelController<Uint8List>();
+      final toBackend = StreamChannelController<Uint8List>();
+      toBack.foreign.stream.listen((data) {
+        atBackend.add(TalkFrame.decode(data));
+        toBackend.foreign.sink.add(data);
+      }, onDone: () => toBackend.foreign.sink.close());
+      toBackend.foreign.stream.listen(
+        toBack.foreign.sink.add,
+        onDone: () => toBack.foreign.sink.close(),
+      );
+      final back = TalkChannel(toBack.local);
+      final backend = TalkChannel(toBackend.local);
+      final forwards = <Future<void>>[];
+      front.messages.listen((m) {
+        // The intermediary answers two items itself, then forwards.
+        m.replyItem(bytes([100])).ignore();
+        m.replyItem(bytes([101])).ignore();
+        forwards.add(forwardMessage(m, back));
+      });
+      serve(
+        backend,
+        (m) => m.replyStream(
+          Stream.fromIterable([
+            bytes([0]),
+            bytes([1]),
+            bytes([2]),
+          ]),
+          trailer: bytes([9]),
+        ),
+      );
+      final s = client.streamRequest('LIST', Uint8List(0), window: 0);
+      final items = <int>[];
+      s.items.listen((i) => items.add(i.payload.single));
+      await pumpEventQueue();
+      expect(atBackend.single.window, 0);
+      List<int> credits() => [
+        for (final f in atBackend)
+          if (f.isCredit) f.creditItems,
+      ];
+      s.grant(1);
+      await pumpEventQueue();
+      expect(items, [100]);
+      expect(credits(), isEmpty);
+      s.grant(2);
+      await pumpEventQueue();
+      expect(items, [100, 101, 0]);
+      expect(credits(), [1]);
+      s.grant(2);
+      expect((await s.done).payload, [9]);
+      expect(items, [100, 101, 0, 1, 2]);
+      expect(credits(), [1, 2]);
+      expect(client.isOpen, isTrue);
+      expect(front.isOpen, isTrue);
+      await Future.wait(forwards);
+      await Future.wait([
+        client.close(),
+        front.close(),
+        back.close(),
+        backend.close(),
+      ]);
     });
 
     for (final (hops, sync) in [(1, false), (2, false), (1, true)]) {

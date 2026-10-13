@@ -31,7 +31,9 @@ part of 'talk_channel.dart';
 ///   replies. The intermediary grants nothing of its own and keeps no
 ///   window: what the far responder sends is relayed at once, so the
 ///   requester's window bounds the far responder end to end (wiki page
-///   "Polyverse Switchboard Talk", "Item windows");
+///   "Polyverse Switchboard Talk", "Item windows"). Items the intermediary
+///   sent itself before forwarding took their share of the window; those
+///   still waiting for it take the first credits, which are not forwarded;
 /// * the final response is passed on as the final reply, with its trailing
 ///   payload;
 /// * an item or final response that is itself a request is forwarded the
@@ -209,7 +211,10 @@ class _Relay implements _ResponseSink {
       ..setReplyTimeout(Duration.zero)
       ..setCreditTimeout(Duration.zero)
       .._cancelHook = relay._onIncomingCancelled
-      .._creditHook = relay._onIncomingCredit;
+      .._creditHook = relay._onIncomingCredit
+      // Replies of the application's own that wait for the window (it is
+      // then 0, and so is the forwarded request's) take the first credits.
+      .._creditOwed = incoming._queuedItems;
     final accepted = incoming._takeCredit();
     try {
       relay._out = send(relay, accepted);

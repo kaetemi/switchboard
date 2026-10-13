@@ -467,6 +467,69 @@ void main() {
       await p.close();
     });
 
+    test('what arrives for a request that waits for the window, before its '
+        'frame went, is for an unknown id', () async {
+      final peer = RawPeer();
+      final requests = StreamQueue(peer.talk.messages);
+      peer.send(streamRequestFrame(1, 0));
+      final m = await requests.next;
+      final item = Outcome(m.replyItem(bytes([1])));
+      final chained = m.startReplyRequest(bytes([2]), procedure: 'MORE');
+      final answer = Outcome(chained.response);
+      final id = chained.requestId;
+      // The peer cannot know of the id yet: whatever names it is stale, for
+      // an earlier request of ours with the id, or invented.
+      peer
+        ..send(
+          TalkFrame(
+            kind: TalkKind.message,
+            responseId: id,
+            payload: bytes([7]),
+          ),
+        )
+        ..send(itemFrame(id, 8))
+        ..send(TalkFrame(kind: TalkKind.extend, responseId: id))
+        ..send(
+          TalkFrame(
+            kind: TalkKind.abort,
+            responseId: id,
+            payload: Status.of(StatusCode.notFound).encode(),
+          ),
+        )
+        ..send(
+          TalkFrame(
+            kind: TalkKind.message,
+            requestId: 5,
+            responseId: id,
+            payload: bytes([9]),
+          ),
+        );
+      await pumpEventQueue();
+      expect(peer.talk.isOpen, isTrue);
+      expect(answer.isDone, isFalse);
+      expect(peer.talk.outgoingRequestCount, 1);
+      // Only the chained response that is a request is answered, NOT_FOUND.
+      expect(peer.received.single.responseId, 5);
+      expect(peer.received.single.status.known, StatusCode.notFound);
+      // The grant lets the item and then the request go; its answer counts.
+      peer.send(credit(1, 1));
+      await pumpEventQueue();
+      expect(item.isDone && item.error == null, isTrue);
+      expect(
+        [for (final f in peer.repliesTo(1)) f.kind],
+        [TalkKind.streamItem, TalkKind.message],
+      );
+      expect(peer.repliesTo(1).last.requestId, id);
+      peer.send(
+        TalkFrame(kind: TalkKind.message, responseId: id, payload: bytes([3])),
+      );
+      await pumpEventQueue();
+      expect(answer.value!.payload, [3]);
+      expect(peer.talk.outgoingRequestCount, 0);
+      await requests.cancel();
+      await peer.talk.close();
+    });
+
     test('a stream request in a reply carries its window, and grants made '
         'while it waits for the window go with it', () async {
       final p = Pair();
@@ -1037,6 +1100,91 @@ void main() {
         async.flushMicrotasks();
       });
     });
+
+    test('a credit that raced the end of a request by its credit bound is '
+        'ignored, and one after the peer reused the id is for the new '
+        'request', () {
+      fakeAsync((async) {
+        final peer = RawPeer(
+          options: const TalkOptions(creditTimeout: Duration(seconds: 3)),
+        );
+        final held = <TalkMessage>[];
+        peer.talk.messages.listen(held.add);
+        peer.send(streamRequestFrame(1, 0));
+        async.flushMicrotasks();
+        final old = Outcome(held.single.replyItem(bytes([1])));
+        async.elapse(second * 3);
+        expect(old.error, isStatus(StatusCode.deadlineExceeded));
+        expect(
+          peer.repliesTo(1).single.status.known,
+          StatusCode.deadlineExceeded,
+        );
+        // Sent before the abort reached the peer: ignored.
+        peer.send(credit(1, 1));
+        async.flushMicrotasks();
+        expect(peer.talk.isOpen, isTrue);
+        expect(peer.repliesTo(1), hasLength(1));
+        // The peer reuses the id, released by the abort; then reuses it
+        // again while it is outstanding here (its own timeout released
+        // it): the earlier one is abandoned, what waited for its window
+        // fails, and credits go to the request that holds the id now.
+        peer.send(streamRequestFrame(1, 0));
+        async.flushMicrotasks();
+        final reused = Outcome(held[1].replyItem(bytes([2])));
+        peer.send(streamRequestFrame(1, 0));
+        async.flushMicrotasks();
+        expect(reused.error, isStatus(StatusCode.failedPrecondition));
+        expect(held[1].isCancelled, isTrue);
+        final current = Outcome(held[2].replyItem(bytes([3])));
+        peer.send(credit(1, 1));
+        async.flushMicrotasks();
+        expect(current.isDone && current.error == null, isTrue);
+        expect(
+          [
+            for (final f in peer.repliesTo(1))
+              if (f.kind == TalkKind.streamItem) f.payload.single,
+          ],
+          [3],
+        );
+        expect(held[2].window, 0);
+        peer.talk.close();
+        async.flushMicrotasks();
+      });
+    });
+
+    test('a long credit bound is armed in steps a JavaScript timer takes, '
+        'and expires on time', () {
+      fakeAsync((async) {
+        // The longest delay a JavaScript timer takes, a signed 32-bit
+        // number of milliseconds (about 24.8 days); a longer one fires at
+        // once.
+        const maxTimerDelay = Duration(milliseconds: 0x7FFFFFFF);
+        void expectTimersInRange() => expect(
+          async.pendingTimers.map((t) => t.duration),
+          everyElement(lessThanOrEqualTo(maxTimerDelay)),
+        );
+        final peer = RawPeer(
+          options: const TalkOptions(creditTimeout: Duration(days: 30)),
+        );
+        TalkMessage? held;
+        peer.talk.messages.listen((m) => held = m);
+        peer.send(streamRequestFrame(1, 0));
+        async.flushMicrotasks();
+        expect(held, isNotNull);
+        expectTimersInRange();
+        async.elapse(const Duration(days: 29));
+        expectTimersInRange();
+        expect(peer.repliesTo(1), isEmpty);
+        async.elapse(const Duration(days: 1));
+        expect(
+          peer.repliesTo(1).single.status.known,
+          StatusCode.deadlineExceeded,
+        );
+        expect(async.pendingTimers, isEmpty);
+        peer.talk.close();
+        async.flushMicrotasks();
+      });
+    });
   });
 
   group('the responder', () {
@@ -1235,6 +1383,76 @@ void main() {
       expect(p.b.incomingRequestCount, 0);
       await source.close();
       await p.close();
+    });
+
+    test('a cancel while items and a chained final wait for the window is '
+        'answered ABORT CANCELLED, the only final; nothing that waited '
+        'goes', () async {
+      final peer = RawPeer();
+      final requests = StreamQueue(peer.talk.messages);
+      peer.send(streamRequestFrame(1, 0));
+      final m = await requests.next;
+      final item = Outcome(m.replyItem(bytes([1])));
+      final chained = m.replyStreamRequest(bytes([2]), window: 3);
+      final chainedDone = Outcome(chained.done);
+      expect(m.canReply, isFalse);
+      expect(peer.talk.outgoingRequestCount, 1);
+      peer.send(
+        TalkFrame(
+          kind: TalkKind.abort,
+          requestId: 1,
+          payload: Status.of(StatusCode.cancelled).encode(),
+        ),
+      );
+      await pumpEventQueue();
+      expect(peer.repliesTo(1).single.kind, TalkKind.abort);
+      expect(peer.repliesTo(1).single.status.known, StatusCode.cancelled);
+      expect(item.error, isStatus(StatusCode.cancelled));
+      expect(chainedDone.error, isStatus(StatusCode.cancelled));
+      expect(m.isCancelled, isTrue);
+      // The chained request never went: its id is free, and a grant for it
+      // sends nothing.
+      expect(peer.talk.outgoingRequestCount, 0);
+      chained.grant(1);
+      // A credit for the cancelled request, sent before the peer saw the
+      // abort, is ignored.
+      peer.send(credit(1, 2));
+      await pumpEventQueue();
+      expect(peer.received, hasLength(1));
+      expect(peer.talk.isOpen, isTrue);
+      await requests.cancel();
+      await peer.talk.close();
+    });
+
+    test('a listener that throws after its final reply, waiting behind '
+        'items for the window, has answered', () async {
+      final peer = RawPeer();
+      late TalkMessage m;
+      final sent = <Outcome<void>>[];
+      peer.talk.messages.listen((message) {
+        m = message;
+        sent
+          ..add(Outcome(message.replyItem(bytes([1]))))
+          ..add(Outcome(message.reply(bytes([2]))));
+        throw StateError('after the answer');
+      });
+      peer.send(streamRequestFrame(1, 0));
+      await pumpEventQueue();
+      // Nothing went, and no ABORT INTERNAL either: the request is
+      // answered, its final waiting behind the item.
+      expect(peer.received, isEmpty);
+      expect(m.canReply, isFalse);
+      expect(m.isCancelled, isFalse);
+      peer.send(credit(1, 1));
+      await pumpEventQueue();
+      expect(
+        [for (final f in peer.repliesTo(1)) f.kind],
+        [TalkKind.streamItem, TalkKind.message],
+      );
+      expect(peer.repliesTo(1).last.payload, [2]);
+      expect(sent.every((o) => o.isDone && o.error == null), isTrue);
+      expect(peer.talk.incomingRequestCount, 0);
+      await peer.talk.close();
     });
 
     test('the end of the channel while exhausted fails the request with '
