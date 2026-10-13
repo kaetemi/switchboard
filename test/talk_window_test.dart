@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GLM 5.3 Flash <noreply@z.ai>
 */
 
 // Item windows on stream requests (wiki page "Polyverse Switchboard Talk",
@@ -654,21 +655,43 @@ void main() {
       await requests.cancel();
     });
 
-    test('items beyond the window are tolerated by the requester', () async {
+    test('an item beyond the window is a channel protocol error on the '
+        'responder', () async {
       final peer = RawPeer();
       final s = peer.talk.streamRequest('LIST', Uint8List(0), window: 1);
       final items = <int>[];
-      s.items.listen((i) => items.add(i.payload.single));
+      final failed = expectLater(
+        s.done,
+        throwsA(isStatus(StatusCode.protocolError)),
+      );
+      s.items.listen((i) => items.add(i.payload.single), onError: (_) {});
       await pumpEventQueue();
       final id = peer.received.single.requestId;
+      // The first item fills the window; the second exceeds it.
       peer
         ..send(itemFrame(id, 1))
         ..send(itemFrame(id, 2));
       await pumpEventQueue();
-      expect(items, [1, 2]);
-      expect(s.window, 0);
-      expect(peer.talk.isOpen, isTrue);
-      s.cancel();
+      expect(items, [1]);
+      expect((await peer.talk.done).known, StatusCode.protocolError);
+      await failed;
+      await peer.talk.close();
+    });
+
+    test('the first item of a request opened with window 0 is a channel '
+        'protocol error on the responder', () async {
+      final peer = RawPeer();
+      final s = peer.talk.streamRequest('LIST', Uint8List(0), window: 0);
+      final failed = expectLater(
+        s.done,
+        throwsA(isStatus(StatusCode.protocolError)),
+      );
+      s.items.listen((_) {}, onError: (_) {});
+      await pumpEventQueue();
+      final id = peer.received.single.requestId;
+      peer.send(itemFrame(id, 1));
+      expect((await peer.talk.done).known, StatusCode.protocolError);
+      await failed;
       await peer.talk.close();
     });
   });
@@ -786,6 +809,84 @@ void main() {
         async.elapse(second * 9);
         expect(peer.repliesTo(1), hasLength(1));
         async.elapse(second);
+        final abort = peer.repliesTo(1).last;
+        expect(abort.kind, TalkKind.abort);
+        expect(abort.status.known, StatusCode.deadlineExceeded);
+        peer.talk.close();
+        async.flushMicrotasks();
+      });
+    });
+
+    test('a declared deadline that passes while the window is exhausted '
+        'fires right after the grant, on the requester', () {
+      fakeAsync((async) {
+        final peer = RawPeer(
+          options: const TalkOptions(requestTimeout: Duration(seconds: 10)),
+        );
+        final s = peer.talk.streamRequest('LIST', Uint8List(0), window: 1);
+        final done = Outcome(s.done);
+        s.items.listen((_) {}, onError: (_) {});
+        async.flushMicrotasks();
+        final id = peer.received.single.requestId;
+        // The responder declares a deadline of 5 s.
+        peer.send(
+          TalkFrame(
+            kind: TalkKind.extend,
+            responseId: id,
+            payload: TalkFrame.extendPayload(deadline: second * 5),
+          ),
+        );
+        async.flushMicrotasks();
+        expect(s.deadline, isNotNull);
+        peer.send(itemFrame(id, 1));
+        async.flushMicrotasks();
+        // Exhausted: the suspension stops the clocks, the declared deadline
+        // among them.
+        expect(s.window, 0);
+        expect(s.deadline, isNull);
+        async.elapse(const Duration(hours: 1));
+        expect(done.isDone, isFalse, reason: 'no timeout while exhausted');
+        // The grant restarts the timeout; the deadline passed during the
+        // wait, so it fires at once.
+        s.grant(1);
+        async.flushMicrotasks();
+        async.elapse(const Duration(milliseconds: 1));
+        expect(done.error, isStatus(StatusCode.deadlineExceeded));
+        expect(peer.received.last.kind, TalkKind.abort);
+        peer.talk.close();
+        async.flushMicrotasks();
+      });
+    });
+
+    test('a declared deadline that passes while the window is exhausted '
+        'fires right after the credit, on the responder', () {
+      fakeAsync((async) {
+        final peer = RawPeer(
+          options: const TalkOptions(replyTimeout: Duration(seconds: 10)),
+        );
+        TalkMessage? held;
+        peer.talk.messages.listen((m) => held = m);
+        peer.send(streamRequestFrame(1, 1));
+        async.flushMicrotasks();
+        final m = held!;
+        unawaited(m.extend(deadline: second * 5));
+        async.flushMicrotasks();
+        m.replyItem(bytes([1]));
+        async.flushMicrotasks();
+        // Exhausted, and nothing waits for a grant: neither the declared
+        // deadline nor the credit bound runs.
+        expect(m.window, 0);
+        async.elapse(const Duration(hours: 1));
+        expect(peer.repliesTo(1).map((f) => f.kind), [
+          TalkKind.extend,
+          TalkKind.streamItem,
+        ]);
+        expect(m.canReply, isTrue);
+        // The credit restarts the timeout; the deadline passed during the
+        // wait, so it fires at once.
+        peer.send(credit(1, 1));
+        async.flushMicrotasks();
+        async.elapse(const Duration(milliseconds: 1));
         final abort = peer.repliesTo(1).last;
         expect(abort.kind, TalkKind.abort);
         expect(abort.status.known, StatusCode.deadlineExceeded);

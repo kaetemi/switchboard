@@ -6,6 +6,7 @@ Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
   GPT-6 Astra <noreply@openai.com>
+  GLM 5.3 Flash <noreply@z.ai>
 */
 
 import 'dart:async';
@@ -2408,6 +2409,14 @@ class TalkChannel {
       _protocolError('STREAM_ITEM for non-stream request ${pending.id}');
       return;
     }
+    if (pending.window == 0) {
+      // The responder may not exceed the window (wiki page "Polyverse
+      // Switchboard Talk", "Item windows"); as for a request without
+      // STREAM, a channel protocol error on its part.
+      _credit(wire);
+      _protocolError('STREAM_ITEM beyond the window of request ${pending.id}');
+      return;
+    }
     pending.itemArrived();
     final message = _Message(this, frame).._creditBytes = wire;
     if (frame.hasRequest) {
@@ -3021,17 +3030,12 @@ class _Outgoing {
   }
 
   /// A stream item arrived: it takes one item of the window, and restarts
-  /// the timeout as any reply does, unless that was the last one granted.
+  /// the timeout as any reply does. An item beyond the window never gets
+  /// here ([TalkChannel._onStreamItem] closes the channel first).
   void itemArrived() {
     final window = this.window;
     if (window != null) {
-      if (window == 0) {
-        // The peer may not exceed the window; tolerated, as the protocol
-        // does not make it an error.
-        _log.warning('item beyond the window of request $id');
-      } else {
-        this.window = window - 1;
-      }
+      this.window = window - 1;
     }
     replied();
   }

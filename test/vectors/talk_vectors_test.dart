@@ -5,6 +5,7 @@ Copyright (C) 2018-2026  Jan BOON (Kaetemi)
 Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
+  GLM 5.3 Flash <noreply@z.ai>
 */
 
 import 'dart:typed_data';
@@ -220,6 +221,8 @@ const List<(String, String)> negative = [
   ('EXTEND with neither id', '30'),
   ('Credit with an 8-byte payload', '32 02 00 00 A0 BB 0D 00 E0 93 04 00'),
   ('Credit of 0 items', '32 02 00 00 00 00 00 00'),
+  ('STREAM on a cancel', '2A 02 00 00 01 00'),
+  ('STREAM on a credit', '3A 02 00 00 08 00 00 00'),
   ('EXTEND with a 4-byte payload', '34 01 00 00 A0 BB 0D 00'),
   ('ABORT with both ids', '26 01 00 00 02 00 00 01 00'),
   ('Plain message without procedure', '00 01'),
@@ -245,9 +248,7 @@ const List<(String, String)> negativeExtra = [
   ('Response id 0', '04 00 00 00'),
   ('Chained with response id 0', '06 01 00 00 00 00 00'),
   ('EXTEND with STREAM and no request', '3C 01 00 00'),
-  ('Credit with STREAM', '3A 02 00 00 08 00 00 00'),
   ('Credit with STREAM and a window', '3A 02 00 00 FF FF FF FF 08 00 00 00'),
-  ('Cancel with STREAM', '2A 02 00 00 01 00'),
   ('Cancel with STREAM and a window', '2A 02 00 00 FF FF FF FF 01 00'),
   ('Credit with an empty payload', '32 02 00 00'),
   ('Credit with a 3-byte payload', '32 02 00 00 08 00 00'),
