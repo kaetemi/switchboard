@@ -36,7 +36,9 @@ abstract class TalkRequest {
   Future<TalkMessage> get response;
 
   /// When the requester timeout expires unless an answer arrives, as wall
-  /// clock time; null when the request has no timeout or has ended. For
+  /// clock time; null when the request has no timeout or has ended, and
+  /// while it waits to be sent behind the item window of the request it
+  /// answers (see [TalkMessage.replyItem]). For
   /// observation (a progress display, a log): the timeout itself runs on a
   /// monotonic clock.
   ///
@@ -56,6 +58,9 @@ abstract class TalkRequest {
   /// The request id stays reserved until the peer's final response arrives
   /// or the requester timeout expires (the channel default if the request
   /// has none); anything arriving for it meanwhile is ignored. Does nothing
-  /// if the request already ended.
+  /// if the request already ended. A request that still waits to be sent
+  /// behind the item window of the request it answers fails at once, and
+  /// is sent in its turn with the cancel right after it (a chained response
+  /// still answers that request).
   void cancel([Status? status]);
 }

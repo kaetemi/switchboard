@@ -77,12 +77,15 @@ abstract class TalkStream {
   /// While the window is exhausted the requester timeout does not run
   /// ([deadline] is null); a grant restarts it, as a reply would. A
   /// request that will not consume any more is cancelled ([cancel]),
-  /// without a grant first.
+  /// without a grant first. A grant made while the request itself waits to
+  /// be sent (a stream request made as an item or a chained response,
+  /// behind the item window of the request it answers) goes with it, in
+  /// the window its frame carries.
   ///
   /// Throws [ArgumentError] when [items] is below 1, or would bring the
   /// window to [TalkFrame.unlimitedWindow] or beyond, and [StateError]
-  /// when the window is unlimited. Does nothing once the request ended
-  /// (answered, failed, cancelled).
+  /// when the window is unlimited. Once the request ended (answered,
+  /// failed, cancelled) it sends nothing and the window stays as it was.
   void grant(int items);
 
   /// The final response. It may carry a trailing payload and may itself be
@@ -93,9 +96,10 @@ abstract class TalkStream {
   Future<TalkMessage> get done;
 
   /// When the requester timeout expires unless an answer arrives, as wall
-  /// clock time; null when the request has no timeout or has ended, and
-  /// while its item window is exhausted ([window] 0: the timeout does not
-  /// run until the next [grant]). For
+  /// clock time; null when the request has no timeout or has ended, while
+  /// its item window is exhausted ([window] 0: the timeout does not run
+  /// until the next [grant]), and while the request waits to be sent
+  /// behind the item window of the request it answers. For
   /// observation (a progress display, a log): the timeout itself runs on a
   /// monotonic clock.
   ///
@@ -116,6 +120,9 @@ abstract class TalkStream {
   /// or the requester timeout expires (the channel default if the request
   /// has none); anything arriving for it meanwhile is ignored, and item
   /// requests are answered with `ABORT CANCELLED`. Does nothing if the
-  /// request already ended.
+  /// request already ended. A request that still waits to be sent behind
+  /// the item window of the request it answers fails at once, and is sent
+  /// in its turn with the cancel right after it (a chained response still
+  /// answers that request).
   void cancel([Status? status]);
 }

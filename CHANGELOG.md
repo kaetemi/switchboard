@@ -275,31 +275,38 @@ The protocol specification lives in the project wiki (section
   until a grant, else the number of items the requester takes; a stream
   request without it is a truncated header. `EXTEND` with `HAS_REQUEST`
   and no `HAS_RESPONSE` is the requester's credit for its own stream
-  request (payload exactly `u32 items`); `EXTEND` with both ids or neither,
-  a credit of 0 items, `STREAM` on an `ABORT` or an `EXTEND`, and, per
-  channel, a credit for an unlimited window, for a request that is not a
-  stream request, or one that would bring the window to `0xFFFFFFFF` or
-  beyond are channel protocol errors; a credit for a request that is not
-  outstanding is ignored. The responder sends no item beyond the window
-  (an item request or a bulk item counts as one): `replyItem`,
+  request (payload exactly `u32 items`). Channel protocol errors: `EXTEND`
+  with both ids or neither, a credit of 0 items, `STREAM` on an `ABORT` or
+  an `EXTEND`, a credit for an unlimited window, for a request that is not
+  a stream request, or one that would bring the window to `0xFFFFFFFF` or
+  beyond, and a `STREAM_ITEM` beyond the window; a credit for a request
+  that is not outstanding is ignored. The responder sends no item beyond
+  the window (an item request or a bulk item counts as one): `replyItem`,
   `replyItemBulk` and the item requests queue in order while it is
-  exhausted, their futures completing once a grant let them go;
-  `replyStream` pauses its source with one item read ahead, so an
-  `async*` handler waits at its `yield` and the end of the source is seen
-  at zero; the final response, `ABORT` and `EXTEND` are never counted and
-  never wait for a grant (a final made while items wait goes after them).
-  While the window is exhausted neither the requester nor the responder
-  timeout runs; the responder's credit bound does
-  (`TalkOptions.creditTimeout`, 60 s; `TalkMessage.setCreditTimeout`;
-  `replyStream(creditTimeout:)`), from the arrival of a request opened with
-  window 0, and aborts `DEADLINE_EXCEEDED`. `streamRequest`,
-  `replyStreamRequest` and `replyItemStreamRequest` take `window:` (null:
-  unlimited); `TalkStream.grant` and `window` on the requester side (no
-  grant is ever made on the application's behalf); `TalkMessage.window`
-  and `whenCredit` on the responder side. `forwardMessage` forwards a
-  stream request with the window it has left and every later credit as a
-  credit for the forwarded request, granting nothing and running no credit
-  bound of its own; `pipeChannels` passes credits as any frame.
+  exhausted, their futures completing once a grant let them go (an item
+  request's handle at once; what the peer sends for its id before its
+  frame went is treated as for an unknown id); `replyStream` pauses its
+  source with one item read ahead, so an `async*` handler waits at its
+  `yield` and the end of the source is seen at zero; the final response,
+  `ABORT` and `EXTEND` are never counted and never wait for a grant (a
+  final made while items wait goes after them, the request counting as
+  answered). While the window is exhausted neither the requester nor the
+  responder timeout runs; the responder's credit bound runs instead while
+  something waits for a grant, and from the arrival of a request opened
+  with window 0 (`TalkOptions.creditTimeout`, 60 s;
+  `TalkMessage.setCreditTimeout`; `replyStream(creditTimeout:)`), and
+  aborts `DEADLINE_EXCEEDED`. `streamRequest`, `replyStreamRequest` and
+  `replyItemStreamRequest` take `window:` (null: unlimited);
+  `TalkStream.grant` and `window` on the requester side (no grant is ever
+  made on the application's behalf); `TalkMessage.window` and `whenCredit`
+  on the responder side. `forwardMessage` forwards a stream request with
+  the window it has left and every later credit as a credit for the
+  forwarded request, granting nothing and running no credit bound of its
+  own (items the intermediary sent itself that still wait for the window
+  take the first credits); an item beyond the window from the far
+  responder closes the intermediary's channel to it `PROTOCOL_ERROR`, and
+  the requester is answered `UNAVAILABLE`. `pipeChannels` passes credits
+  as any frame.
 - Connections to a node's own listeners: a connection the node initiates
   to an endpoint `isOwnEndpoint` recognises (TCP, WebSocket or `mem`) is an
   in-process `MemoryTransport` pair instead of a socket to itself. One side

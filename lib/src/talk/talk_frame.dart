@@ -263,7 +263,8 @@ class TalkFrame {
   }
 
   /// Encodes to the short canonical form: optional fields are present only
-  /// when set.
+  /// when set, the item [window] whenever [stream] is (unlimited
+  /// included).
   ///
   /// Throws [ArgumentError] if the frame breaks a rule a receiver would
   /// reject as a protocol error, so that this implementation never sends

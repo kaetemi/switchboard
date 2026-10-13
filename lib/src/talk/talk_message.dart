@@ -128,10 +128,11 @@ abstract class TalkMessage {
   ///
   /// At 0 the window is exhausted: an item waits for a grant (the future
   /// of [replyItem] with it, nothing on the wire), [replyStream] pauses its
-  /// source, and the responder timeout does not run; the credit bound does
-  /// ([setCreditTimeout]). The final reply, [replyAbort] and [extend] are
-  /// never counted and never wait for a grant, except that a final reply
-  /// goes after the items made before it.
+  /// source, and the responder timeout does not run; the credit bound runs
+  /// instead while something waits for a grant ([setCreditTimeout]). The
+  /// final reply, [replyAbort] and [extend] are never counted and never
+  /// wait for a grant, except that a final reply goes after the items made
+  /// before it.
   int? get window;
 
   /// Completes once [window] is above 0, or the request has ended
@@ -148,9 +149,11 @@ abstract class TalkMessage {
   /// a grant while its item window is exhausted and this side has
   /// something to send (an item waiting, a [replyStream] source paused,
   /// [whenCredit] waited for), and, for a request opened with window 0,
-  /// from its arrival until the first grant. On expiry the channel
-  /// answers `ABORT DEADLINE_EXCEEDED` on the application's behalf and
-  /// the request is cancelled ([onCancel]).
+  /// from its arrival (for one with a bulk payload, from its delivery, as
+  /// the responder timeout) until the first grant. On expiry the channel
+  /// answers `ABORT DEADLINE_EXCEEDED` on the application's behalf, what
+  /// waited for the window is not sent, and the request is cancelled
+  /// ([onCancel]).
   ///
   /// [TalkOptions.creditTimeout] when [timeout] is null, none when it is
   /// [Duration.zero]. A bound that is running restarts with the new value.
@@ -159,10 +162,11 @@ abstract class TalkMessage {
   void setCreditTimeout(Duration? timeout);
 
   /// True once the peer cancelled this request, or once the request can no
-  /// longer be answered: the responder timeout expired, the channel closed,
-  /// the peer reused its id, or the listener it was delivered to threw
-  /// before answering it (the channel then answered `ABORT INTERNAL`). Work
-  /// on the request should stop.
+  /// longer be answered: the responder timeout or the credit bound
+  /// ([setCreditTimeout]) expired, the channel closed, the peer reused its
+  /// id, or the listener it was delivered to threw before answering it (the
+  /// channel then answered `ABORT INTERNAL`). Work on the request should
+  /// stop.
   bool get isCancelled;
 
   /// Completes when [isCancelled] becomes true. Never completes for a
@@ -182,8 +186,9 @@ abstract class TalkMessage {
   Future<void> get onCancel;
 
   /// True while a reply method may still be called: the message expects a
-  /// reply, no final reply was sent (by the application, by the responder
-  /// timeout, or by the channel), and the channel is open.
+  /// reply, no final reply was made (by the application, sent or waiting
+  /// behind items for the item window, by the responder timeout, or by the
+  /// channel), and the channel is open.
   bool get canReply;
 
   /// Sends the final response.
@@ -196,10 +201,14 @@ abstract class TalkMessage {
   ///
   /// The final response is never counted against the item window
   /// ([window]) and never waits for a grant itself, so a stream that ends
-  /// while the window is exhausted ends at once; made while items wait
-  /// for a grant, it goes after them, and the request counts as answered
-  /// meanwhile. The same holds for the chained responses
-  /// ([startReplyRequest] and the others) and [replyBulk].
+  /// while the window is exhausted ends at once. Made while items wait for
+  /// a grant, it goes after them, and the request counts as answered
+  /// meanwhile ([canReply] is false; a listener that throws after making
+  /// it does not abort the request); if the request ends first (the
+  /// peer's cancel, the credit bound, the channel's end) it is not sent
+  /// and its future fails with the reason. The same holds for the chained
+  /// responses ([startReplyRequest] and the others, whose request is then
+  /// not sent either and fails likewise) and [replyBulk].
   ///
   /// The returned future completes once the response was handed to the
   /// connection within the channel's send window (for a bulk payload,
