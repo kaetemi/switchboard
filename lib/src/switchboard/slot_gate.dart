@@ -582,29 +582,47 @@ class SlotGate implements SlotHandler {
   /// refused; it never completes with an error. A queued request that can
   /// no longer be answered (cancelled, or its channel closed) leaves the
   /// queue and is dropped.
+  ///
+  /// [onRefused] reports a plain message refused before its handler accepts
+  /// it, including a queued refusal or failed forwarding. It runs at most
+  /// once before the future completes. Requests keep their abort responses
+  /// and do not call it. Callback errors are logged, not propagated.
   Future<void> serveRequest(
     TalkMessage message,
     int slot,
     FutureOr<void> Function(TalkMessage message) handler, {
     Uint8List? payload,
+    void Function(Status status)? onRefused,
   }) async {
+    var reported = false;
+    void refused(Status status) {
+      if (reported || message.expectsReply) return;
+      reported = true;
+      try {
+        onRefused?.call(status);
+      } catch (error, stack) {
+        _log.warning('plain gate refusal callback failed', error, stack);
+      }
+    }
+
+    final report = onRefused == null ? null : refused;
     final s = _slots[slot];
     switch (s?.state) {
       case null:
         final count = client.slotTable(type)?.count;
         if (count != null && slot >= count) {
           _log.fine('$type gate: request for slot $slot outside $count');
-          _abort(message, genericStatus(StatusCode.outOfRange));
+          _refuse(message, genericStatus(StatusCode.outOfRange), report);
           return;
         }
-        _abort(message, movedStatus(slot));
+        _refuse(message, movedStatus(slot), report);
       case SlotGateState.loading || SlotGateState.locked:
         if (_queuedRequests >= maxQueuedRequests) {
           _log.info('$type gate: request refused, $maxQueuedRequests queued');
-          _abort(message, genericStatus(StatusCode.unavailable));
+          _refuse(message, genericStatus(StatusCode.unavailable), report);
           return;
         }
-        final parked = _Parked(message, handler, payload);
+        final parked = _Parked(message, handler, payload, report);
         _queuedRequests++;
         s!.requests.add(parked);
         // A request that can no longer be answered leaves the queue.
@@ -615,6 +633,7 @@ class SlotGate implements SlotHandler {
           gone.then((_) {
             if (s.requests.remove(parked)) {
               _queuedRequests--;
+              _refuse(message, genericStatus(StatusCode.unavailable), report);
               parked.finish();
             }
           }),
@@ -623,7 +642,7 @@ class SlotGate implements SlotHandler {
       case SlotGateState.serving:
         await _run(s!, message, handler);
       case SlotGateState.forwarding:
-        await _forwardRequest(s!, slot, message, payload);
+        await _forwardRequest(s!, slot, message, payload, report);
     }
   }
 
@@ -652,12 +671,13 @@ class SlotGate implements SlotHandler {
     int slot,
     TalkMessage message,
     Uint8List? payload,
+    void Function(Status status)? onRefused,
   ) async {
     if (message.expectsReply && !message.canReply) {
       return;
     }
     if (_queuedRequests >= maxQueuedRequests) {
-      _abort(message, genericStatus(StatusCode.unavailable));
+      _refuse(message, genericStatus(StatusCode.unavailable), onRefused);
       return;
     }
     _queuedRequests++;
@@ -673,17 +693,20 @@ class SlotGate implements SlotHandler {
       target = await _forwardChannel(s, slot, f);
     } on Object catch (e) {
       _log.info('$type gate: cannot forward a request for $slot: $e');
-      _abort(message, genericStatus(StatusCode.unavailable));
+      _refuse(message, genericStatus(StatusCode.unavailable), onRefused);
       _relayEnded(s, f);
       return;
     } finally {
       _queuedRequests--;
     }
     try {
-      await forwardMessage(message, target);
+      await forwardMessage(message, target, onRefused: onRefused);
     } on Object catch (e, st) {
       // The application forwarded it already: nothing more to do.
       _log.severe('$type gate: forwarding a request for $slot failed', e, st);
+      if (!message.expectsReply) {
+        _refuse(message, genericStatus(StatusCode.unavailable), onRefused);
+      }
     } finally {
       _relayEnded(s, f);
     }
@@ -777,6 +800,18 @@ class SlotGate implements SlotHandler {
     f.channel = opening;
     opening.ignore();
     return opening;
+  }
+
+  static void _refuse(
+    TalkMessage message,
+    Status status,
+    void Function(Status status)? onRefused,
+  ) {
+    if (!message.expectsReply) {
+      onRefused?.call(status);
+    } else {
+      _abort(message, status);
+    }
   }
 
   static void _abort(TalkMessage message, Status status) {
@@ -1129,6 +1164,7 @@ class SlotGate implements SlotHandler {
           slot,
           parked.message,
           parked.payload,
+          parked.onRefused,
         ).whenComplete(parked.finish),
       );
     }
@@ -1261,7 +1297,7 @@ class SlotGate implements SlotHandler {
       unawaited(incoming.reject(moved));
     }
     for (final parked in _takeRequests(s)) {
-      _abort(parked.message, moved);
+      _refuse(parked.message, moved, parked.onRefused);
       parked.finish();
     }
   }
@@ -1501,13 +1537,14 @@ class _Forward {
 
 /// A request queued by [SlotGate.serveRequest].
 class _Parked {
-  _Parked(this.message, this.handler, this.payload);
+  _Parked(this.message, this.handler, this.payload, this.onRefused);
 
   final TalkMessage message;
   final FutureOr<void> Function(TalkMessage message) handler;
 
   /// The credential to forward it with; null for its channel's.
   final Uint8List? payload;
+  final void Function(Status status)? onRefused;
   final Completer<void> done = Completer<void>();
 
   void finish() {
