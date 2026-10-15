@@ -6,6 +6,7 @@ Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
   GPT-6 Astra <noreply@openai.com>
+  GPT-6.1 Sol <noreply@openai.com>
 */
 
 // The slot gate state machine: queueing, forwarding, resuming and
@@ -1111,6 +1112,102 @@ void main() {
 
   group('requests', () {
     late List<String> answered;
+
+    void plainLifecycle(
+      List<(String, Status)> refusals,
+      List<String> handled,
+      List<String> completed,
+    ) {
+      lifecycle.onServe = (channel, _) {
+        gate.detach(channel);
+        channel.talk().messages.listen((message) {
+          unawaited(
+            gate
+                .serveRequest(
+                  message,
+                  int.parse(text(message.payload)),
+                  (accepted) => handled.add(accepted.procedureName),
+                  onRefused: (status) =>
+                      refusals.add((message.procedureName, status)),
+                )
+                .then((_) => completed.add(message.procedureName)),
+          );
+        });
+      };
+    }
+
+    test('plain absent, overflow and revoked queued work report once before completion', () async {
+      newGate(trackChannels: false, maxQueuedRequests: 1);
+      final refusals = <(String, Status)>[];
+      final handled = <String>[], completed = <String>[];
+      plainLifecycle(refusals, handled, completed);
+      await gate.onAssign(assign(1));
+      final talk = TalkChannel(peer.open(shard: 1));
+      await until(() => lifecycle.served[1]?.isNotEmpty == true);
+      await talk.send('ABSENT', bytes('5'));
+      await until(() => completed.contains('ABSENT'));
+      expect(refusals.single.$2, isMoved());
+      await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+      await talk.send('QUEUED', bytes('1'));
+      await talk.send('EXCESS', bytes('1'));
+      await until(() => completed.contains('EXCESS'));
+      expect(completed, isNot(contains('QUEUED')));
+      expect(refusals.last.$2, hasCode(StatusCode.unavailable));
+      await gate.onRevoke(kv, 1);
+      await until(() => completed.contains('QUEUED'));
+      expect(refusals.last.$2, isMoved());
+      expect(refusals.map((r) => r.$1), ['ABSENT', 'EXCESS', 'QUEUED']);
+      expect(handled, isEmpty);
+      await talk.close();
+      await settle();
+      expect(refusals, hasLength(3));
+    });
+
+    test(
+      'plain accepted work and resumed queued work never report a refusal',
+      () async {
+        newGate(trackChannels: false);
+        final refusals = <(String, Status)>[];
+        final handled = <String>[], completed = <String>[];
+        plainLifecycle(refusals, handled, completed);
+        await gate.onAssign(assign(1));
+        final talk = TalkChannel(peer.open(shard: 1));
+        await talk.send('HERE', bytes('1'));
+        await until(() => completed.contains('HERE'));
+        await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+        await talk.send('RESUME', bytes('1'));
+        await settle();
+        await gate.onResume(ResumeRequest(kv, 1, epoch: 1));
+        await until(() => completed.contains('RESUME'));
+        expect(handled, ['HERE', 'RESUME']);
+        expect(refusals, isEmpty);
+        await talk.close();
+      },
+    );
+
+    test('queued and late plain forwarding failures retain their refusal callbacks', () async {
+      node.resolver = StaticResolver([]);
+      newGate(trackChannels: false);
+      final refusals = <(String, Status)>[];
+      final handled = <String>[], completed = <String>[];
+      plainLifecycle(refusals, handled, completed);
+      await gate.onAssign(assign(1));
+      final talk = TalkChannel(peer.open(shard: 1));
+      await until(() => lifecycle.served[1]?.isNotEmpty == true);
+      await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+      await talk.send('QUEUED', bytes('1'));
+      await settle();
+      await gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 2));
+      await until(() => completed.contains('QUEUED'));
+      await talk.send('LATE', bytes('1'));
+      await until(() => completed.contains('LATE'));
+      expect(refusals.map((r) => r.$1), ['QUEUED', 'LATE']);
+      for (final refusal in refusals) {
+        expect(refusal.$2, hasCode(StatusCode.unavailable));
+      }
+      expect(handled, isEmpty);
+      await talk.close();
+    });
 
     test(
       'revocation from a request refuses the rest of the released queue',

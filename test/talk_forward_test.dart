@@ -6,6 +6,7 @@ Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
   GPT-6 Astra <noreply@openai.com>
+  GPT-6.1 Sol <noreply@openai.com>
 */
 
 import 'dart:async';
@@ -1027,6 +1028,66 @@ void main() {
   });
 
   group('forwardMessage', () {
+    test('a closed target reports one transient plain refusal and keeps request aborts', () async {
+      final source = Chain(proxies: 0), target = Chain(proxies: 0);
+      addTearDown(source.close);
+      addTearDown(target.close);
+      final messages = StreamQueue(source.backend.messages);
+      addTearDown(messages.cancel);
+      await target.client.close();
+      final plain = messages.next;
+      await source.client.send('NOTE', bytes([1]));
+      final refused = <Status>[];
+      await forwardMessage(await plain, target.client, onRefused: refused.add);
+      expect(refused, hasLength(1));
+      expect(refused.single.known, StatusCode.unavailable);
+      final request = messages.next;
+      final response = source.client.request('ASK', Uint8List(0));
+      final aborted = expectLater(
+        response,
+        throwsStatus(StatusCode.unavailable),
+      );
+      await forwardMessage(
+        await request,
+        target.client,
+        onRefused: refused.add,
+      );
+      await aborted;
+      expect(
+        refused,
+        hasLength(1),
+        reason: 'requests use their abort response',
+      );
+    });
+
+    test('successful plain forwarding does not refuse and callback errors are contained', () async {
+      final source = Chain(proxies: 0), target = Chain(proxies: 0);
+      addTearDown(source.close);
+      addTearDown(target.close);
+      final messages = StreamQueue(source.backend.messages);
+      addTearDown(messages.cancel);
+      final plain = messages.next;
+      final received = target.backend.messages.first;
+      await source.client.send('NOTE', bytes([7]));
+      final refused = <Status>[];
+      await forwardMessage(await plain, target.client, onRefused: refused.add);
+      expect((await received).payload, [7]);
+      expect(refused, isEmpty);
+      await target.client.close();
+      final next = messages.next;
+      await source.client.send('NOTE', bytes([8]));
+      var calls = 0;
+      await forwardMessage(
+        await next,
+        target.client,
+        onRefused: (_) {
+          calls++;
+          throw StateError('application refusal callback failed');
+        },
+      );
+      expect(calls, 1);
+    });
+
     test('refuses foreign messages and double forwarding', () async {
       final chain = Chain(proxies: 0);
       expect(
@@ -1226,6 +1287,36 @@ void main() {
       expect((await received).payload, pattern(100000));
       await pumpEventQueue();
       expect(forwarded, isTrue);
+    });
+
+    test('a failed in-progress plain bulk transfer reports only transient uncertainty', () async {
+      final (client, front) = await muxTalk(
+        far: TalkOptions(streamBulk: (_) => true),
+      );
+      final (back, backend) = await muxTalk(
+        far: TalkOptions(streamBulk: (_) => true),
+      );
+      final source = StreamController<List<int>>();
+      addTearDown(() => source.close().timeout(const Duration(seconds: 5)));
+      final refused = <Status>[];
+      final forwarded = Completer<void>();
+      front.messages.listen((message) {
+        forwardMessage(
+          message,
+          back,
+          onRefused: refused.add,
+        ).then((_) => forwarded.complete());
+      });
+      final arrived = backend.messages.first;
+      client.send('NOTE', Uint8List(0), bulk: source.stream).ignore();
+      source.add(pattern(100000));
+      await arrived.timeout(const Duration(seconds: 5));
+      await back
+          .close(Status.of(StatusCode.unavailable))
+          .timeout(const Duration(seconds: 5));
+      await forwarded.future.timeout(const Duration(seconds: 5));
+      expect(refused, hasLength(1));
+      expect(refused.single.known, StatusCode.unavailable);
     });
 
     test('forwarding stays active until the bulk reply has finished', () async {

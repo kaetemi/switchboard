@@ -6,6 +6,7 @@ Authors:
   Jan Boon <jan.boon@kaetemi.be>
   Claude Opus 5.5 <noreply@anthropic.com>
   GPT-6 Astra <noreply@openai.com>
+  GPT-6.1 Sol <noreply@openai.com>
 */
 
 part of 'talk_channel.dart';
@@ -85,7 +86,17 @@ part of 'talk_channel.dart';
 ///
 /// Throws [ArgumentError] if [incoming] was not received by a
 /// [TalkChannel], and [StateError] if it is already being forwarded.
-Future<void> forwardMessage(TalkMessage incoming, TalkChannel target) {
+/// [onRefused], when provided, reports a plain message whose forwarding
+/// failed, once, before this future completes. The status is `UNAVAILABLE`:
+/// a failed transfer does not establish whether the peer acted, so retrying
+/// application work still requires its original idempotency identity.
+/// Requests retain their ordinary abort responses and do not call it.
+/// A callback error is logged and does not change forwarding's completion.
+Future<void> forwardMessage(
+  TalkMessage incoming,
+  TalkChannel target, {
+  void Function(Status status)? onRefused,
+}) {
   if (incoming is! _Message) {
     throw ArgumentError.value(
       incoming,
@@ -96,29 +107,59 @@ Future<void> forwardMessage(TalkMessage incoming, TalkChannel target) {
   final procedure = incoming.frame.procedure ?? Name.empty;
   if (!incoming.expectsReply) {
     final done = Completer<void>();
+    var reported = false;
+    void refused() {
+      if (reported) return;
+      reported = true;
+      try {
+        onRefused?.call(Status.of(StatusCode.unavailable));
+      } catch (error, stack) {
+        _log.warning('plain forwarding refusal callback failed', error, stack);
+      }
+    }
+
+    void finished() {
+      if (!done.isCompleted) done.complete();
+    }
+
     void failed(SwitchboardException error) {
       _log.fine('forwarded ${incoming.frame} dropped: $error');
       incoming._bulk?.abandon();
-      if (!done.isCompleted) {
-        done.complete();
-      }
+      refused();
+      finished();
     }
 
     final accepted = incoming._takeCredit();
     try {
       final (payload, bulk) = incoming._forwardPayload();
-      target._sendFrame(
+      final sent = target._sendFrame(
         TalkFrame(
           kind: TalkKind.message,
           procedure: procedure,
           payload: payload,
         ),
         bulk: bulk,
-        onSent: (out) =>
-            done.complete(out?.done.then<void>((_) {}, onError: (Object _) {})),
+        onSent: (out) {
+          if (onRefused == null && !done.isCompleted) {
+            // Preserve the original pacing for callers not observing drops.
+            done.complete(out?.done.then<void>((_) {}, onError: (Object _) {}));
+          }
+        },
         onFailure: failed,
         onAccepted: accepted,
       );
+      if (onRefused != null) {
+        // This includes asynchronous transport and bulk-transfer failures.
+        // They remain indeterminate UNAVAILABLE outcomes, never permanent
+        // application refusals or assertions that the peer did not act.
+        sent.then<void>(
+          (_) => finished(),
+          onError: (Object _) {
+            refused();
+            finished();
+          },
+        );
+      }
     } on SwitchboardException catch (e) {
       accepted();
       failed(e);
