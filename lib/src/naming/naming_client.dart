@@ -1556,7 +1556,7 @@ class _Session {
   Future<void> tearDown() async {
     // Nothing worth waiting for in the cancels. Cancelling a subscription
     // to a stream that already ended returns a future of the root zone,
-    // which a fake clock (package:fake_async) never completes.
+    // which a virtual clock (package:fake_async) never completes.
     messages?.cancel().ignore();
     await closeChannel;
     if (!_closed.isCompleted) {

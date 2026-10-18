@@ -98,9 +98,9 @@ class Pair {
 
 /// Stands in for the mux channel: closable with a status, has an end
 /// status.
-class FakeMuxChannel extends StreamChannelMixin<Uint8List>
+class StatusClosableChannel extends StreamChannelMixin<Uint8List>
     implements StatusClosable {
-  FakeMuxChannel(this._inner);
+  StatusClosableChannel(this._inner);
 
   final StreamChannel<Uint8List> _inner;
   final Completer<Status> _done = Completer<Status>();
@@ -134,13 +134,13 @@ class RawPeer {
   RawPeer({TalkOptions options = const TalkOptions()}) {
     final c = StreamChannelController<Uint8List>();
     raw = c.foreign;
-    mux = FakeMuxChannel(c.local);
+    mux = StatusClosableChannel(c.local);
     talk = TalkChannel(mux, options: options);
     raw.stream.listen((frame) => received.add(TalkFrame.decode(frame)));
   }
 
   late final StreamChannel<Uint8List> raw;
-  late final FakeMuxChannel mux;
+  late final StatusClosableChannel mux;
   late final TalkChannel talk;
   final List<TalkFrame> received = [];
 

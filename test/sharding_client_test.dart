@@ -588,8 +588,8 @@ void main() {
       handlerA.drain = (_) => Completer<void>().future;
       log.clear();
       Object? migrated;
-      // Listened to rather than drained: under fake time the cancel that
-      // drain makes on an error completes outside the fake zone.
+      // Listened to rather than drained: under virtual time the cancel that
+      // drain makes on an error completes outside the fake_async zone.
       b
           .migrate(zone, 2, to: 2)
           .listen(

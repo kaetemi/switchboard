@@ -11,7 +11,7 @@ Authors:
 // The naming service and identity (wiki page "Polyverse Switchboard Identity and
 // Credentials", stage B): scope enforcement per `_ns` channel (connection
 // identity, or a credential in the open payload), RENEW and the renewal of
-// a MeshNode's credential (with fake time), the end of a channel whose
+// a MeshNode's credential (with virtual time), the end of a channel whose
 // credential expires, slot spaces defined again after a restart, and
 // CONNECT brokering (a late dial-back included), over mem:// nodes.
 
@@ -92,7 +92,7 @@ Future<void> until(bool Function() condition) async {
   }
 }
 
-/// A node, closed after the test (unless [close] is false, for fake time,
+/// A node, closed after the test (unless [close] is false, for virtual time,
 /// where the test closes it).
 Future<Switchboard> node({
   Credential? credential,

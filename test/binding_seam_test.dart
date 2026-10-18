@@ -10,7 +10,7 @@ Authors:
 
 // The binding seam: the node, Talk (bulk payloads, whenWritable), identity,
 // the proxy, slot channels and the reconnecting client over connections
-// that are not the frame mux ([FakeBinding], a stream-shaped test double),
+// that are not the frame mux ([MemoryBinding], a stream-shaped test double),
 // the binding registry and Switchboard.adopt.
 
 import 'dart:async';
@@ -20,7 +20,7 @@ import 'dart:typed_data';
 import 'package:switchboard/switchboard.dart';
 import 'package:test/test.dart';
 
-import 'fake_binding.dart';
+import 'memory_binding.dart';
 
 const fast = MuxOptions(
   goAwayGrace: Duration(milliseconds: 100),
@@ -59,7 +59,7 @@ Future<void> until(bool Function() condition) async {
   }
 }
 
-/// Lets the timers that deliver the fake wire's records run.
+/// Lets the timers that deliver the in-memory wire's records run.
 Future<void> settle() => Future<void>.delayed(const Duration(milliseconds: 20));
 
 /// A node closed after the test.
@@ -90,10 +90,11 @@ Switchboard node({
   return s;
 }
 
-/// A fake listener at `fake://[name]` for [server], stopped after the test.
+/// A listener at `membinding://[name]` for [server], stopped after the
+/// test.
 Uri listen(Switchboard server, String name, {ChannelPolicy? policy}) {
-  addTearDown(() => FakeBinding.stop(name));
-  return FakeBinding.listen(server, name, policy: policy);
+  addTearDown(() => MemoryBinding.stop(name));
+  return MemoryBinding.listen(server, name, policy: policy);
 }
 
 /// A Talk service answering every request with its payload.
@@ -128,11 +129,13 @@ Future<String> answerOf(MuxChannel channel) async {
   return text(frames.single);
 }
 
-/// Talk on both ends of a fake connection pair, the bulk channels of each
+/// Talk on both ends of a memory binding pair, the bulk channels of each
 /// side routed to its Talk layer as a node routes them.
-Future<(TalkChannel, TalkChannel, FakeConnection, FakeConnection)>
+Future<
+  (TalkChannel, TalkChannel, MemoryBindingConnection, MemoryBindingConnection)
+>
 talkPair() async {
-  final (a, b) = FakeConnection.pair(initiator: fast, acceptor: fast);
+  final (a, b) = MemoryBindingConnection.pair(initiator: fast, acceptor: fast);
   addTearDown(a.close);
   addTearDown(b.close);
   final server = Completer<TalkChannel>();
@@ -198,7 +201,10 @@ void main() {
       final framed = frame.open(Uint8List(0));
       expect(framed, isA<FrameMuxChannel>());
       expect(framed.sendCost(10), 26);
-      final (x, y) = FakeConnection.pair(initiator: fast, acceptor: fast);
+      final (x, y) = MemoryBindingConnection.pair(
+        initiator: fast,
+        acceptor: fast,
+      );
       addTearDown(x.close);
       addTearDown(y.close);
       final streamed = x.open(Uint8List(0));
@@ -214,7 +220,10 @@ void main() {
     test(
       'channel ids are the same at both ends, with the mux parity',
       () async {
-        final (a, b) = FakeConnection.pair(initiator: fast, acceptor: fast);
+        final (a, b) = MemoryBindingConnection.pair(
+          initiator: fast,
+          acceptor: fast,
+        );
         addTearDown(a.close);
         addTearDown(b.close);
         final atB = <MuxChannel>[];
@@ -243,7 +252,7 @@ void main() {
         server.registerService(echo, echoService);
         final uri = listen(server, 'echo-1');
         final accepted = server.connections.first;
-        final binding = FakeBinding();
+        final binding = MemoryBinding();
         final asked = <Uri>[];
         final client = node(
           bindings: [binding],
@@ -252,18 +261,18 @@ void main() {
             return null;
           },
         );
-        expect(client.bindingSchemes, {'fake'});
+        expect(client.bindingSchemes, {'membinding'});
         final talk = await client.openTalkAt(uri, ChannelAddress(type: echo));
         final reply = await talk.request('ECHO', bytes('hello')).timeout(limit);
         expect(text(reply.payload), 'hello');
         // The channel is the binding's, not the frame mux's.
-        expect(talk.raw, isA<FakeChannel>());
+        expect(talk.raw, isA<MemoryBindingChannel>());
         final connection = binding.dialled.single;
         expect(connection.sent['data'], greaterThan(0));
-        expect(asked, [Uri.parse('fake://echo-1')]);
+        expect(asked, [Uri.parse('membinding://echo-1')]);
         // Another spelling of the endpoint shares the pooled connection.
         final again = await client.openTalkAt(
-          Uri.parse('FAKE://Echo-1#echo'),
+          Uri.parse('MEMBINDING://Echo-1#echo'),
           ChannelAddress(type: echo),
         );
         expect(
@@ -274,7 +283,7 @@ void main() {
         expect(identical(await client.connect(uri), connection), isTrue);
         // The accepted side was adopted by the server, which dispatched.
         final atServer = await accepted.timeout(limit);
-        expect(atServer, isA<FakeConnection>());
+        expect(atServer, isA<MemoryBindingConnection>());
         expect(atServer.isInitiator, isFalse);
         // Closing the client sends the server's side GOAWAY.
         await client.close();
@@ -293,7 +302,7 @@ void main() {
         ServiceRecord(ServiceAddress(echo, 1), endpoints: [uri]),
       ]);
       addTearDown(resolver.close);
-      final client = node(bindings: [FakeBinding()], resolver: resolver);
+      final client = node(bindings: [MemoryBinding()], resolver: resolver);
       final talk = await client.openTalk(ServiceAddress(echo));
       final reply = await talk.request('ECHO', bytes('found')).timeout(limit);
       expect(text(reply.payload), 'found');
@@ -302,11 +311,11 @@ void main() {
     test('a binding that cannot reach its endpoint, or not in time', () async {
       final held = _HeldBinding();
       final client = node(
-        bindings: [FakeBinding(), held],
+        bindings: [MemoryBinding(), held],
         connectTimeout: const Duration(milliseconds: 50),
       );
       await expectLater(
-        client.connect(Uri.parse('fake://nobody')),
+        client.connect(Uri.parse('membinding://nobody')),
         throwsCode(StatusCode.unavailable),
       );
       await expectLater(
@@ -314,7 +323,10 @@ void main() {
         throwsCode(StatusCode.unavailable),
       );
       // The connection that arrives after the node gave up is closed.
-      final (late, peer) = FakeConnection.pair(initiator: fast, acceptor: fast);
+      final (late, peer) = MemoryBindingConnection.pair(
+        initiator: fast,
+        acceptor: fast,
+      );
       addTearDown(peer.close);
       held.attempts.single.complete(late);
       expect(
@@ -330,7 +342,7 @@ void main() {
 
     test('registerBinding refuses built-in, malformed and claimed schemes', () {
       final s = node();
-      for (final scheme in ['ws', 'wss', 'tcp', 'mem', 'Fake', '1x']) {
+      for (final scheme in ['ws', 'wss', 'tcp', 'mem', 'Membinding', '1x']) {
         expect(
           () => s.registerBinding(_Schemes({scheme})),
           throwsArgumentError,
@@ -343,9 +355,9 @@ void main() {
         throwsArgumentError,
       );
       expect(s.bindingSchemes, isEmpty);
-      s.registerBinding(FakeBinding());
-      expect(() => s.registerBinding(FakeBinding()), throwsArgumentError);
-      expect(s.bindingSchemes, {'fake'});
+      s.registerBinding(MemoryBinding());
+      expect(() => s.registerBinding(MemoryBinding()), throwsArgumentError);
+      expect(s.bindingSchemes, {'membinding'});
       expect(
         () => Switchboard(
           bindings: [
@@ -360,7 +372,10 @@ void main() {
         'while closing', () async {
       final server = node();
       server.registerService(echo, echoService);
-      final (a, b) = FakeConnection.pair(initiator: fast, acceptor: fast);
+      final (a, b) = MemoryBindingConnection.pair(
+        initiator: fast,
+        acceptor: fast,
+      );
       addTearDown(a.close);
       expect(await server.adopt(b, remote: 'adopted'), same(b));
       await expectLater(server.adopt(b), throwsArgumentError);
@@ -370,14 +385,20 @@ void main() {
         'x',
       );
       // A connection whose channels something else reads.
-      final (c, d) = FakeConnection.pair(initiator: fast, acceptor: fast);
+      final (c, d) = MemoryBindingConnection.pair(
+        initiator: fast,
+        acceptor: fast,
+      );
       addTearDown(c.close);
       addTearDown(d.close);
       d.incoming.listen((_) {});
       await expectLater(server.adopt(d), throwsStateError);
       await server.close();
       expect(await a.done.timeout(limit), hasCode(StatusCode.goingAway));
-      final (e, f) = FakeConnection.pair(initiator: fast, acceptor: fast);
+      final (e, f) = MemoryBindingConnection.pair(
+        initiator: fast,
+        acceptor: fast,
+      );
       addTearDown(e.close);
       await expectLater(
         server.adopt(f),
@@ -477,7 +498,7 @@ void main() {
       server.registerService(npc, answer);
       final uri = listen(server, 'id-1', policy: ChannelPolicies.scoped());
       final client = node(
-        bindings: [FakeBinding()],
+        bindings: [MemoryBinding()],
         credential: await npcCredential(),
         holderKey: npcKey,
       );
@@ -488,9 +509,9 @@ void main() {
         'npc for npc-7',
       );
       final connection = await client.connect(uri);
-      expect((connection as FakeConnection).sent['_Ident'], 1);
+      expect((connection as MemoryBindingConnection).sent['_Ident'], 1);
       // A node without a credential is refused once the hold expires.
-      final anonymous = node(bindings: [FakeBinding()]);
+      final anonymous = node(bindings: [MemoryBinding()]);
       expect(
         await answerOf(
           await anonymous.openChannelAt(uri, ChannelAddress(type: npc)),
@@ -515,7 +536,9 @@ void main() {
       );
       // Control records arrive well after the channels.
       final client = node(
-        bindings: [FakeBinding(controlDelay: const Duration(milliseconds: 50))],
+        bindings: [
+          MemoryBinding(controlDelay: const Duration(milliseconds: 50)),
+        ],
         credential: await npcCredential(),
         holderKey: npcKey,
         identifyOutgoing: false,
@@ -541,7 +564,7 @@ void main() {
       server.registerService(npc, answer);
       final uri = listen(server, 'id-3');
       final client = node(
-        bindings: [FakeBinding()],
+        bindings: [MemoryBinding()],
         credential: await rogue.issue(
           kind: CredentialKind.node,
           identity: 'npc-7',
@@ -566,7 +589,7 @@ void main() {
       ServiceRecord(ServiceAddress(echo, 1), endpoints: [backendUri]),
     ]);
     addTearDown(resolver.close);
-    final binding = FakeBinding();
+    final binding = MemoryBinding();
     final proxy = node(bindings: [binding], resolver: resolver);
     proxy.catchAll = proxyHandler(proxy);
     final proxyUri = await proxy.listenMemory();
@@ -585,7 +608,10 @@ void main() {
 
   test('a slot channel holds what it sends while it reopens at its '
       'channel\'s sendCost', () async {
-    final (a, b) = FakeConnection.pair(initiator: fast, acceptor: fast);
+    final (a, b) = MemoryBindingConnection.pair(
+      initiator: fast,
+      acceptor: fast,
+    );
     addTearDown(a.close);
     addTearDown(b.close);
     b.incoming.listen(
@@ -626,10 +652,10 @@ void main() {
       'channels', () async {
     final server = node();
     server.registerService(echo, echoService);
-    final accepted = <FakeConnection>[];
+    final accepted = <MemoryBindingConnection>[];
     final client = ReconnectingClient.connections(
       (options) async {
-        final (local, remote) = FakeConnection.pair(
+        final (local, remote) = MemoryBindingConnection.pair(
           initiator: options,
           acceptor: server.muxOptions,
         );
@@ -648,7 +674,7 @@ void main() {
       (talk) async => ready.add(talk),
     );
     await until(() => ready.length == 1);
-    expect(ready.single.raw, isA<FakeChannel>());
+    expect(ready.single.raw, isA<MemoryBindingChannel>());
     expect(
       text((await ready.single.request('ECHO', bytes('one'))).payload),
       'one',

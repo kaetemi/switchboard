@@ -8,7 +8,7 @@ Authors:
 */
 
 // Bulk channels over a binding whose channels are independent streams
-// ([FakeBinding]): the receiver rules of the binding specification
+// ([MemoryBinding]): the receiver rules of the binding specification
 // (section "Bulk payloads": a parent not arrived yet, a parent ended, the
 // number order), Talk keeping the payloads referenced before a graceful
 // close, the proxy forwarding them toward the frame mux, the bounds of all
@@ -23,14 +23,15 @@ import 'package:switchboard/switchboard.dart';
 import 'package:test/test.dart';
 
 import 'binding_seam_test.dart' as h;
-import 'fake_binding.dart';
+import 'memory_binding.dart';
 
-/// A fake pair, the records of the channels [delayed] names [delay] late.
-(FakeConnection, FakeConnection) pair({
+/// A memory binding pair, the records of the channels [delayed] names
+/// [delay] late.
+(MemoryBindingConnection, MemoryBindingConnection) pair({
   bool Function(int id)? delayed,
   Duration delay = const Duration(milliseconds: 100),
 }) {
-  final (a, b) = FakeConnection.pair(
+  final (a, b) = MemoryBindingConnection.pair(
     initiator: h.fast,
     acceptor: h.fast,
     channelDelay: delayed == null
@@ -208,7 +209,10 @@ void main() {
     test('a bulk channel naming a channel of the receiver\'s own parity that '
         'is not open is refused at once', () {
       fakeAsync((clock) {
-        final (a, b) = FakeConnection.pair(initiator: h.fast, acceptor: h.fast);
+        final (a, b) = MemoryBindingConnection.pair(
+          initiator: h.fast,
+          acceptor: h.fast,
+        );
         b.incoming.listen(TalkChannel.adoptBulk);
         // The acceptor's ids are odd.
         final child = a.open(TalkBulkOpen(1001, 1).encode());
@@ -249,7 +253,10 @@ void main() {
     test('a graceful close waits for an awaited bulk channel at most the '
         'bulk open timeout, then lets go of it', () {
       fakeAsync((clock) {
-        final (a, b) = FakeConnection.pair(initiator: h.fast, acceptor: h.fast);
+        final (a, b) = MemoryBindingConnection.pair(
+          initiator: h.fast,
+          acceptor: h.fast,
+        );
         final receiver = Receiver(b);
         final parent = a.open(ChannelAddress(type: h.echo).encode());
         unawaited(parent.send(bulkMessage(1, 3)));
@@ -277,7 +284,10 @@ void main() {
 
     test('a late transfer that stalls is cut by the bulk idle timeout', () {
       fakeAsync((clock) {
-        final (a, b) = FakeConnection.pair(initiator: h.fast, acceptor: h.fast);
+        final (a, b) = MemoryBindingConnection.pair(
+          initiator: h.fast,
+          acceptor: h.fast,
+        );
         final receiver = Receiver(
           b,
           options: const TalkOptions(bulkIdleTimeout: Duration(seconds: 2)),
@@ -311,7 +321,7 @@ void main() {
       'at most 16 ended channels of a connection wait for bulk channels',
       () {
         fakeAsync((clock) {
-          final (a, b) = FakeConnection.pair(
+          final (a, b) = MemoryBindingConnection.pair(
             initiator: h.fast,
             acceptor: h.fast,
           );
@@ -374,9 +384,9 @@ void main() {
   });
 
   group('the proxy over independent streams', () {
-    /// A client on the fake binding (its first bulk channel slow), a proxy
+    /// A client on the memory binding (its first bulk channel slow), a proxy
     /// piping its channels to a frame mux, and a Talk server behind.
-    Future<(FakeConnection, Receiver)> proxied() async {
+    Future<(MemoryBindingConnection, Receiver)> proxied() async {
       final (client, front) = pair(delayed: (id) => id == 4);
       final (x, y) = MemoryTransport.pair();
       final back = MuxConnection(x, isInitiator: true, options: h.fast);
@@ -430,11 +440,11 @@ void main() {
     test('the proxy holds a graceful close for an awaited bulk channel at '
         'most the hold timeout', () {
       fakeAsync((clock) {
-        final (client, front) = FakeConnection.pair(
+        final (client, front) = MemoryBindingConnection.pair(
           initiator: h.fast,
           acceptor: h.fast,
         );
-        final (back, server) = FakeConnection.pair(
+        final (back, server) = MemoryBindingConnection.pair(
           initiator: h.fast,
           acceptor: h.fast,
         );
@@ -469,7 +479,7 @@ void main() {
   group('the listeners of a binding', () {
     test('a declared endpoint is listed, the node\'s own, and reached '
         'in-process under its policy', () async {
-      final binding = FakeBinding();
+      final binding = MemoryBinding();
       final node = h.node(bindings: [binding]);
       final remotes = <String?>[];
       node.registerService(h.echo, (incoming) {
@@ -480,8 +490,8 @@ void main() {
       final endpoint = h.listen(node, 'self', policy: policy);
       await node.addListeningEndpoint(endpoint, policy: policy);
       expect(node.listeningEndpoints, [endpoint]);
-      expect(node.isOwnEndpoint(Uri.parse('FAKE://Self#echo')), isTrue);
-      expect(node.isOwnEndpoint(Uri.parse('fake://other')), isFalse);
+      expect(node.isOwnEndpoint(Uri.parse('MEMBINDING://Self#echo')), isTrue);
+      expect(node.isOwnEndpoint(Uri.parse('membinding://other')), isFalse);
       final channel = await node.openChannelAt(
         endpoint,
         ChannelAddress(type: h.echo),
@@ -501,7 +511,7 @@ void main() {
 
     test('without local connections a declared endpoint is dialled through '
         'its binding', () async {
-      final binding = FakeBinding();
+      final binding = MemoryBinding();
       final node = Switchboard(
         muxOptions: h.fast,
         bindings: [binding],
@@ -520,8 +530,8 @@ void main() {
     });
 
     test('the proxy never forwards to a declared endpoint', () async {
-      final binding = FakeBinding();
-      final self = Uri.parse('fake://proxy-self');
+      final binding = MemoryBinding();
+      final self = Uri.parse('membinding://proxy-self');
       final resolver = StaticResolver([
         ServiceRecord(ServiceAddress(h.echo, 1), endpoints: [self]),
       ]);
@@ -543,21 +553,39 @@ void main() {
     test('a wildcard address answers to the local names; removal and close '
         'forget the endpoint', () async {
       final node = h.node();
-      final endpoint = Uri.parse('fake://0.0.0.0:4433');
+      final endpoint = Uri.parse('membinding://0.0.0.0:4433');
       await node.addListeningEndpoint(endpoint);
-      expect(node.isOwnEndpoint(Uri.parse('fake://127.0.0.1:4433')), isTrue);
-      expect(node.isOwnEndpoint(Uri.parse('fake://localhost:4433')), isTrue);
-      expect(node.isOwnEndpoint(Uri.parse('fake://localhost:4434')), isFalse);
-      final named = Uri.parse('fake://node.example:4444');
+      expect(
+        node.isOwnEndpoint(Uri.parse('membinding://127.0.0.1:4433')),
+        isTrue,
+      );
+      expect(
+        node.isOwnEndpoint(Uri.parse('membinding://localhost:4433')),
+        isTrue,
+      );
+      expect(
+        node.isOwnEndpoint(Uri.parse('membinding://localhost:4434')),
+        isFalse,
+      );
+      final named = Uri.parse('membinding://node.example:4444');
       await node.addListeningEndpoint(
         named,
         address: InternetAddress.loopbackIPv4,
       );
-      expect(node.isOwnEndpoint(Uri.parse('fake://NODE.example:4444')), isTrue);
-      expect(node.isOwnEndpoint(Uri.parse('fake://localhost:4444')), isTrue);
-      expect(node.isOwnEndpoint(Uri.parse('fake://127.0.0.2:4444')), isFalse);
+      expect(
+        node.isOwnEndpoint(Uri.parse('membinding://NODE.example:4444')),
+        isTrue,
+      );
+      expect(
+        node.isOwnEndpoint(Uri.parse('membinding://localhost:4444')),
+        isTrue,
+      );
+      expect(
+        node.isOwnEndpoint(Uri.parse('membinding://127.0.0.2:4444')),
+        isFalse,
+      );
       await expectLater(
-        node.addListeningEndpoint(Uri.parse('fake://0.0.0.0:4433')),
+        node.addListeningEndpoint(Uri.parse('membinding://0.0.0.0:4433')),
         throwsArgumentError,
       );
       await expectLater(
@@ -566,7 +594,10 @@ void main() {
       );
       expect(node.removeListeningEndpoint(endpoint), isTrue);
       expect(node.removeListeningEndpoint(endpoint), isFalse);
-      expect(node.isOwnEndpoint(Uri.parse('fake://127.0.0.1:4433')), isFalse);
+      expect(
+        node.isOwnEndpoint(Uri.parse('membinding://127.0.0.1:4433')),
+        isFalse,
+      );
       expect(node.listeningEndpoints, [named]);
       await node.close();
       expect(node.listeningEndpoints, isEmpty);

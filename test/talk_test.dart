@@ -71,7 +71,7 @@ class RawPeer {
   RawPeer({TalkOptions options = const TalkOptions(), bool mux = false}) {
     final c = StreamChannelController<Uint8List>();
     raw = c.foreign;
-    this.mux = mux ? FakeMuxChannel(c.local) : null;
+    this.mux = mux ? StatusClosableChannel(c.local) : null;
     talk = TalkChannel(this.mux ?? c.local, options: options);
     raw.stream.listen(
       (frame) => received.add(TalkFrame.decode(frame)),
@@ -81,7 +81,7 @@ class RawPeer {
 
   late final StreamChannel<Uint8List> raw;
   late final TalkChannel talk;
-  late final FakeMuxChannel? mux;
+  late final StatusClosableChannel? mux;
   final List<TalkFrame> received = [];
   bool ended = false;
 
@@ -91,9 +91,9 @@ class RawPeer {
 
 /// Stands in for the mux channel: closable with a status, has an end
 /// status.
-class FakeMuxChannel extends StreamChannelMixin<Uint8List>
+class StatusClosableChannel extends StreamChannelMixin<Uint8List>
     implements StatusClosable {
-  FakeMuxChannel(this._inner);
+  StatusClosableChannel(this._inner);
 
   final StreamChannel<Uint8List> _inner;
   final List<Status> closedWith = [];
