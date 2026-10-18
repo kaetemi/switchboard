@@ -1136,7 +1136,8 @@ void main() {
       };
     }
 
-    test('plain absent, overflow and revoked queued work report once before completion', () async {
+    test('plain absent, overflow and revoked queued work report once '
+        'before completion', () async {
       newGate(trackChannels: false, maxQueuedRequests: 1);
       final refusals = <(String, Status)>[];
       final handled = <String>[], completed = <String>[];
@@ -1185,7 +1186,8 @@ void main() {
       },
     );
 
-    test('queued and late plain forwarding failures retain their refusal callbacks', () async {
+    test('queued and late plain forwarding failures retain their refusal '
+        'callbacks', () async {
       node.resolver = StaticResolver([]);
       newGate(trackChannels: false);
       final refusals = <(String, Status)>[];
@@ -1206,6 +1208,90 @@ void main() {
         expect(refusal.$2, hasCode(StatusCode.unavailable));
       }
       expect(handled, isEmpty);
+      await talk.close();
+    });
+
+    test('plain messages handed to the new owner, queued and late, are not '
+        'refused', () async {
+      newGate(trackChannels: false);
+      final refusals = <(String, Status)>[];
+      final handled = <String>[], completed = <String>[];
+      plainLifecycle(refusals, handled, completed);
+      final received = <String>[];
+      target.registerService(kv, (incoming) {
+        incoming.talk().messages.listen((m) => received.add(m.procedureName));
+      }, instance: 2);
+      await gate.onAssign(assign(1));
+      final talk = TalkChannel(peer.open(shard: 1));
+      await until(() => lifecycle.served[1]?.isNotEmpty == true);
+      await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+      await talk.send('QUEUED', bytes('1'));
+      await settle();
+      await gate.onForward(ForwardRequest(kv, 1, epoch: 2, to: 2));
+      await talk.send('LATE', bytes('1'));
+      await until(() => completed.length == 2 && received.length == 2);
+      expect(received, unorderedEquals(['QUEUED', 'LATE']));
+      expect(refusals, isEmpty);
+      expect(handled, isEmpty);
+      await talk.close();
+    });
+
+    test('a queued plain message whose channel closes is refused '
+        'UNAVAILABLE once, and not served on RESUME', () async {
+      newGate(trackChannels: false);
+      final refusals = <(String, Status)>[];
+      final handled = <String>[], completed = <String>[];
+      plainLifecycle(refusals, handled, completed);
+      await gate.onAssign(assign(1));
+      final talk = TalkChannel(peer.open(shard: 1));
+      await until(() => lifecycle.served[1]?.isNotEmpty == true);
+      await gate.onDrain(DrainRequest(kv, 1, epoch: 2, to: 2));
+      await talk.send('QUEUED', bytes('1'));
+      await settle();
+      expect(completed, isEmpty);
+      await talk.close();
+      await until(() => completed.contains('QUEUED'));
+      expect(refusals.single.$1, 'QUEUED');
+      expect(refusals.single.$2, hasCode(StatusCode.unavailable));
+      await gate.onResume(ResumeRequest(kv, 1, epoch: 1));
+      await settle();
+      expect(handled, isEmpty);
+      expect(refusals, hasLength(1));
+    });
+
+    test('a plain refusal callback whose future fails is logged, not left '
+        'unhandled', () async {
+      newGate(trackChannels: false);
+      final logged = gateLogs(Level.WARNING);
+      final completed = <String>[];
+      var calls = 0;
+      lifecycle.onServe = (channel, _) {
+        gate.detach(channel);
+        channel.talk().messages.listen((message) {
+          unawaited(
+            gate
+                .serveRequest(
+                  message,
+                  int.parse(text(message.payload)),
+                  (_) {},
+                  onRefused: (_) async {
+                    calls++;
+                    await Future<void>.delayed(Duration.zero);
+                    throw StateError('the retry could not be recorded');
+                  },
+                )
+                .then((_) => completed.add(message.procedureName)),
+          );
+        });
+      };
+      await gate.onAssign(assign(1));
+      final talk = TalkChannel(peer.open(shard: 1));
+      await until(() => lifecycle.served[1]?.isNotEmpty == true);
+      await talk.send('ABSENT', bytes('5'));
+      await until(() => completed.contains('ABSENT'));
+      await settle();
+      expect(calls, 1);
+      expect(logged, ['plain gate refusal callback failed']);
       await talk.close();
     });
 

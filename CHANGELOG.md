@@ -393,6 +393,25 @@ The protocol specification lives in the project wiki (section
   registers no instance of is sent and refused by the naming service
   instead of never completing. `MeshNode.leave()` keeps at most 64
   `RELEASE`s and 64 hand-over migrations in flight.
+- Refused plain messages reported: a plain message cannot be answered
+  with an abort, so an intermediary or a slot gate that drops one can now
+  tell the application. `forwardMessage(onRefused:)` hears of a plain
+  message that could not be forwarded (the target closed, the message not
+  handed to its connection, or its bulk payload not sent whole) with
+  `UNAVAILABLE`: a failed transfer does not establish whether the far peer
+  acted, so work retried for it keeps its original idempotency identity.
+  With the callback, a plain message's future also waits for the target's
+  send window to take its frame. `SlotGate.serveRequest(onRefused:)` hears
+  of a plain message the gate refuses, with the status a request would be
+  aborted with: `OUT_OF_RANGE` or `MOVED` for a slot not served here,
+  `MOVED` for a queued one when the slot stops being served with its queue
+  unread, `UNAVAILABLE` beyond `maxQueuedRequests`, for a queued one whose
+  channel closed, and when forwarding it to the new owner failed. A plain
+  message handed to the connection, or to the new owner's channel, counts
+  as forwarded. Each callback is called at most once, before the returned
+  future completes; requests never call it and keep their aborts, item
+  windows and credits; an error it throws, or a future it returns that
+  fails, is logged. Without the callbacks nothing changes.
 - Security and resource limits: listener policies, with ready-made ones
   that refuse the reserved types, generic rejection reasons, frame limits checked before
   allocation, per-connection receive buffers, a budget for

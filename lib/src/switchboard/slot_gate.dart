@@ -584,25 +584,41 @@ class SlotGate implements SlotHandler {
   /// no longer be answered (cancelled, or its channel closed) leaves the
   /// queue and is dropped.
   ///
-  /// [onRefused] reports a plain message refused before its handler accepts
-  /// it, including a queued refusal or failed forwarding. It runs at most
-  /// once before the future completes. Requests keep their abort responses
-  /// and do not call it. Callback errors are logged, not propagated.
+  /// A plain message (one that expects no reply) cannot be answered with an
+  /// abort. [onRefused], when given, hears of one refused here instead,
+  /// with the status a request would get: `OUT_OF_RANGE` or `MOVED` for a
+  /// slot not served here; `MOVED` for a queued one when the slot stops
+  /// being served here with its queue unread (revoked, released, a failed
+  /// load, [close]); `UNAVAILABLE` beyond [maxQueuedRequests], for a queued
+  /// one whose channel closed, and when forwarding it failed (see
+  /// [forwardMessage]: a failed transfer leaves open whether the new owner
+  /// acted). A plain message [handler] ran for, or that was handed to the
+  /// new owner's channel, was not refused here; what the new owner does
+  /// with it is not reported. It is called at most once, possibly before
+  /// this returns and always before the future completes. Requests never
+  /// call it; they are answered as above. An error the callback throws, or
+  /// a future it returns that fails, is logged and changes nothing else.
   Future<void> serveRequest(
     TalkMessage message,
     int slot,
     FutureOr<void> Function(TalkMessage message) handler, {
     Uint8List? payload,
-    void Function(Status status)? onRefused,
+    FutureOr<void> Function(Status status)? onRefused,
   }) async {
     var reported = false;
     void refused(Status status) {
-      if (reported || message.expectsReply) return;
+      final callback = onRefused;
+      if (reported || callback == null || message.expectsReply) return;
       reported = true;
+      void callbackFailed(Object error, StackTrace stack) =>
+          _log.warning('plain gate refusal callback failed', error, stack);
       try {
-        onRefused?.call(status);
+        final result = callback(status);
+        if (result is Future<void>) {
+          unawaited(result.then<void>((_) {}, onError: callbackFailed));
+        }
       } catch (error, stack) {
-        _log.warning('plain gate refusal callback failed', error, stack);
+        callbackFailed(error, stack);
       }
     }
 

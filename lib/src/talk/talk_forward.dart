@@ -17,9 +17,11 @@ part of 'talk_channel.dart';
 /// [TalkChannel.messages] it lets through, in both directions.
 ///
 /// A message that expects no reply is sent on [target] as a plain message;
-/// if [target] is closed it is dropped. A request is sent on [target] as a
-/// new request with the same procedure, payload and `STREAM` flag, and
-/// everything that comes back for it is relayed to [incoming], in order:
+/// if [target] is closed, or the message cannot be handed to its
+/// connection, it is dropped (see [onRefused] below). A request is sent on
+/// [target] as a new request with the same procedure, payload and `STREAM`
+/// flag, and everything that comes back for it is relayed to [incoming],
+/// in order:
 ///
 /// * stream items and `EXTEND`s are passed on as they arrive, an `EXTEND`
 ///   with its payload unchanged (the deadline and renewal the far
@@ -84,18 +86,30 @@ part of 'talk_channel.dart';
 /// If [incoming] can no longer be answered (it was already answered or
 /// cancelled), nothing is forwarded.
 ///
+/// [onRefused], when given, hears of a plain message that could not be
+/// forwarded: [target] closed, or the message not handed to [target]'s
+/// connection, or its bulk payload not sent whole. It is called once, with
+/// `UNAVAILABLE`, possibly before [forwardMessage] returns and always
+/// before its future completes. The status is transient on purpose: a
+/// failed transfer does not establish whether the far peer acted (a bulk
+/// payload can fail after its message went), so work retried for the
+/// message keeps its original idempotency identity. A plain message handed
+/// to the connection counts as forwarded, and what becomes of it beyond
+/// (lost with the connection, dropped by the far peer) is not reported; a
+/// caller that needs to know sends a request. With [onRefused], the future
+/// of a plain message also waits for [target]'s send window to take its
+/// frame, so that a failure there is known before it completes. Requests
+/// never call it: their failures are answered with aborts as above, and
+/// nothing about their item windows or credits changes. An error the
+/// callback throws, or a future it returns that fails, is logged and
+/// changes nothing else.
+///
 /// Throws [ArgumentError] if [incoming] was not received by a
 /// [TalkChannel], and [StateError] if it is already being forwarded.
-/// [onRefused], when provided, reports a plain message whose forwarding
-/// failed, once, before this future completes. The status is `UNAVAILABLE`:
-/// a failed transfer does not establish whether the peer acted, so retrying
-/// application work still requires its original idempotency identity.
-/// Requests retain their ordinary abort responses and do not call it.
-/// A callback error is logged and does not change forwarding's completion.
 Future<void> forwardMessage(
   TalkMessage incoming,
   TalkChannel target, {
-  void Function(Status status)? onRefused,
+  FutureOr<void> Function(Status status)? onRefused,
 }) {
   if (incoming is! _Message) {
     throw ArgumentError.value(
@@ -109,12 +123,21 @@ Future<void> forwardMessage(
     final done = Completer<void>();
     var reported = false;
     void refused() {
-      if (reported) return;
+      final callback = onRefused;
+      if (reported || callback == null) return;
       reported = true;
+      void callbackFailed(Object error, StackTrace stack) => _log.warning(
+        'plain forwarding refusal callback failed',
+        error,
+        stack,
+      );
       try {
-        onRefused?.call(Status.of(StatusCode.unavailable));
+        final result = callback(Status.of(StatusCode.unavailable));
+        if (result is Future<void>) {
+          unawaited(result.then<void>((_) {}, onError: callbackFailed));
+        }
       } catch (error, stack) {
-        _log.warning('plain forwarding refusal callback failed', error, stack);
+        callbackFailed(error, stack);
       }
     }
 

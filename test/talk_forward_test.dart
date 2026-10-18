@@ -15,6 +15,7 @@ import 'dart:typed_data';
 import 'package:async/async.dart';
 import 'package:clock/clock.dart';
 import 'package:fake_async/fake_async.dart';
+import 'package:logging/logging.dart';
 import 'package:stream_channel/stream_channel.dart';
 import 'package:switchboard/core.dart';
 import 'package:switchboard/src/switchboard/slot_channel.dart';
@@ -1028,7 +1029,8 @@ void main() {
   });
 
   group('forwardMessage', () {
-    test('a closed target reports one transient plain refusal and keeps request aborts', () async {
+    test('a closed target reports one transient plain refusal and keeps '
+        'request aborts', () async {
       final source = Chain(proxies: 0), target = Chain(proxies: 0);
       addTearDown(source.close);
       addTearDown(target.close);
@@ -1060,7 +1062,8 @@ void main() {
       );
     });
 
-    test('successful plain forwarding does not refuse and callback errors are contained', () async {
+    test('successful plain forwarding does not refuse and callback errors '
+        'are contained', () async {
       final source = Chain(proxies: 0), target = Chain(proxies: 0);
       addTearDown(source.close);
       addTearDown(target.close);
@@ -1086,6 +1089,38 @@ void main() {
         },
       );
       expect(calls, 1);
+    });
+
+    test('a refusal callback whose future fails is logged, not left '
+        'unhandled', () async {
+      final source = Chain(proxies: 0), target = Chain(proxies: 0);
+      addTearDown(source.close);
+      addTearDown(target.close);
+      final messages = StreamQueue(source.backend.messages);
+      addTearDown(messages.cancel);
+      final logged = <String>[];
+      final logs = Logger.root.onRecord.listen((r) {
+        if (r.loggerName == 'Switchboard.Talk' && r.level >= Level.WARNING) {
+          logged.add(r.message);
+        }
+      });
+      addTearDown(logs.cancel);
+      await target.client.close();
+      final plain = messages.next;
+      await source.client.send('NOTE', bytes([1]));
+      var calls = 0;
+      await forwardMessage(
+        await plain,
+        target.client,
+        onRefused: (_) async {
+          calls++;
+          await Future<void>.delayed(Duration.zero);
+          throw StateError('the retry could not be recorded');
+        },
+      );
+      await pumpEventQueue();
+      expect(calls, 1);
+      expect(logged, ['plain forwarding refusal callback failed']);
     });
 
     test('refuses foreign messages and double forwarding', () async {
@@ -1289,7 +1324,8 @@ void main() {
       expect(forwarded, isTrue);
     });
 
-    test('a failed in-progress plain bulk transfer reports only transient uncertainty', () async {
+    test('a failed in-progress plain bulk transfer reports only transient '
+        'uncertainty', () async {
       final (client, front) = await muxTalk(
         far: TalkOptions(streamBulk: (_) => true),
       );
@@ -1717,6 +1753,63 @@ void main() {
         ).encode(),
       );
       await forwarding;
+      await subscription.cancel();
+      await Future.wait([front.close(), back.close()]);
+    });
+
+    test('onRefused leaves a stream request its window, its credits and '
+        'its abort', () async {
+      final toClient = StreamChannelController<Uint8List>();
+      final toBackend = StreamChannelController<Uint8List>();
+      final front = TalkChannel(toClient.local);
+      final back = TalkChannel(toBackend.local);
+      final atBackend = <TalkFrame>[];
+      final atClient = <TalkFrame>[];
+      toBackend.foreign.stream.listen(
+        (data) => atBackend.add(TalkFrame.decode(data)),
+      );
+      toClient.foreign.stream.listen(
+        (data) => atClient.add(TalkFrame.decode(data)),
+      );
+      final held = <TalkMessage>[];
+      final subscription = front.messages.listen(held.add);
+      toClient.foreign.sink
+        ..add(
+          TalkFrame(
+            kind: TalkKind.message,
+            procedure: Name('LIST'),
+            requestId: 1,
+            stream: true,
+            window: 1,
+          ).encode(),
+        )
+        ..add(hexBytes('32 01 00 00 03 00 00 00'));
+      await pumpEventQueue();
+      final refused = <Status>[];
+      final forwarding = forwardMessage(
+        held.single,
+        back,
+        onRefused: refused.add,
+      );
+      await pumpEventQueue();
+      expect(atBackend.single.window, 4);
+      toClient.foreign.sink.add(hexBytes('32 01 00 00 02 00 00 00'));
+      await pumpEventQueue();
+      expect(atBackend.last.isCredit, isTrue);
+      expect(atBackend.last.creditItems, 2);
+      toBackend.foreign.sink.add(
+        TalkFrame(
+          kind: TalkKind.abort,
+          responseId: atBackend.first.requestId,
+          payload: Status.of(StatusCode.notFound).encode(),
+        ).encode(),
+      );
+      await forwarding;
+      await pumpEventQueue();
+      expect(atClient.last.kind, TalkKind.abort);
+      expect(atClient.last.responseId, 1);
+      expect(atClient.last.status.known, StatusCode.notFound);
+      expect(refused, isEmpty);
       await subscription.cancel();
       await Future.wait([front.close(), back.close()]);
     });
