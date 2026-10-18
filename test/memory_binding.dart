@@ -8,21 +8,22 @@ Authors:
   GPT-6 Astra <noreply@openai.com>
 */
 
-// A fake binding of the connection contract, for the tests of the seam:
-// there is no mux frame anywhere. Each channel is a "stream" whose records
-// (its open, its subframes, credit, its close) go to the peer's channel
-// object through an in-process wire, in order per stream, the way a QUIC
-// stream carries them; the connection's control messages (PING, PONG,
+// An in-memory binding of the connection contract, for the tests of the
+// seam: there is no mux frame anywhere. Each channel is a "stream" whose
+// records (its open, its subframes, credit, its close) go to the peer's
+// channel object through an in-process wire, in order per stream, the way a
+// QUIC stream carries them; the connection's control messages (PING, PONG,
 // GOAWAY, NONCE, IDENT) go on a control "stream" of their own, which may
-// be slower than the channels ([FakeConnection.pair]'s `controlDelay`), as
-// the streams of a QUIC connection are not ordered with each other. Flow
+// be slower than the channels ([MemoryBindingConnection.pair]'s
+// `controlDelay`), as the streams of a QUIC connection are not ordered with
+// each other. Its scheme is `membinding`, distinct from the node's own
+// in-process `mem://` endpoints, whose connections run the frame mux. Flow
 // control counts payload bytes plus one byte per record (empty records
-// must be bounded too), the
-// windows are the [MuxOptions.initialWindow] of each side, known to the
-// other from the start (as QUIC's transport parameters are), and channel
-// ids are carried in the open record as the binding contract has it: the
-// initiator's even (2, 4, ...), the acceptor's odd (3, 5, ...), each used
-// once.
+// must be bounded too), the windows are the [MuxOptions.initialWindow] of
+// each side, known to the other from the start (as QUIC's transport
+// parameters are), and channel ids are carried in the open record as the
+// binding contract has it: the initiator's even (2, 4, ...), the
+// acceptor's odd (3, 5, ...), each used once.
 //
 // `IDENT` is checked with the core's `verifyIdent`, as a real binding
 // would; nothing else of the frame mux is used.
@@ -65,9 +66,10 @@ class _Ident extends _Control {
 /// The end of the connection, after everything sent before it.
 class _Closed extends _Control {}
 
-/// A connection of the fake binding. Make one with [FakeConnection.pair].
-class FakeConnection extends BindingConnection {
-  FakeConnection._(
+/// A connection of the memory binding. Make one with
+/// [MemoryBindingConnection.pair].
+class MemoryBindingConnection extends BindingConnection {
+  MemoryBindingConnection._(
     this.isInitiator,
     this.options,
     this.controlDelay,
@@ -83,14 +85,24 @@ class FakeConnection extends BindingConnection {
 
   /// Two connected sides: the initiator and the acceptor. Control records
   /// take [controlDelay] longer than channel records.
-  static (FakeConnection, FakeConnection) pair({
+  static (MemoryBindingConnection, MemoryBindingConnection) pair({
     MuxOptions initiator = const MuxOptions(),
     MuxOptions acceptor = const MuxOptions(),
     Duration controlDelay = Duration.zero,
     Duration Function(int id)? channelDelay,
   }) {
-    final a = FakeConnection._(true, initiator, controlDelay, channelDelay);
-    final b = FakeConnection._(false, acceptor, controlDelay, channelDelay);
+    final a = MemoryBindingConnection._(
+      true,
+      initiator,
+      controlDelay,
+      channelDelay,
+    );
+    final b = MemoryBindingConnection._(
+      false,
+      acceptor,
+      controlDelay,
+      channelDelay,
+    );
     a._peer = b;
     b._peer = a;
     return (a, b);
@@ -109,11 +121,12 @@ class FakeConnection extends BindingConnection {
   /// channels may overtake one another; records of one channel cannot.
   final Duration Function(int id)? channelDelay;
 
-  late final FakeConnection _peer;
+  late final MemoryBindingConnection _peer;
   late final StreamController<MuxChannel> _incoming;
-  final Map<int, FakeChannel> _channels = {};
-  final Queue<FakeChannel> _undelivered = Queue<FakeChannel>();
-  final Set<FakeChannel> _payloads = {};
+  final Map<int, MemoryBindingChannel> _channels = {};
+  final Queue<MemoryBindingChannel> _undelivered =
+      Queue<MemoryBindingChannel>();
+  final Set<MemoryBindingChannel> _payloads = {};
   int _openPayloadBytes = 0;
   bool _incomingScheduled = false;
   final Completer<Status> _done = Completer<Status>();
@@ -142,7 +155,7 @@ class FakeConnection extends BindingConnection {
   final Queue<_Control> _heldControl = Queue<_Control>();
 
   /// Records of every kind sent so far, by kind: for tests that want to
-  /// see what went over the fake wire.
+  /// see what went over the in-memory wire.
   final Map<String, int> sent = {};
 
   void _count(String kind) => sent[kind] = (sent[kind] ?? 0) + 1;
@@ -225,7 +238,10 @@ class FakeConnection extends BindingConnection {
   MuxChannel open(Uint8List openPayload) =>
       _openLocal(openPayload, continuation: false).._postOpen();
 
-  FakeChannel _openLocal(Uint8List openPayload, {required bool continuation}) {
+  MemoryBindingChannel _openLocal(
+    Uint8List openPayload, {
+    required bool continuation,
+  }) {
     if (_closing || (_goAwaySent && !continuation)) {
       throw SwitchboardException.of(
         StatusCode.failedPrecondition,
@@ -258,7 +274,7 @@ class FakeConnection extends BindingConnection {
     }
     final id = _nextId;
     _nextId += 2;
-    final channel = FakeChannel._(
+    final channel = MemoryBindingChannel._(
       this,
       id,
       isLocallyOpened: true,
@@ -271,7 +287,7 @@ class FakeConnection extends BindingConnection {
   }
 
   /// The peer opened [opener].
-  void _onOpen(FakeChannel opener) {
+  void _onOpen(MemoryBindingChannel opener) {
     Status? rejection;
     if (_goAwaySent && !_continuesOpenChannel(opener.openPayload)) {
       rejection = Status.of(StatusCode.goingAway);
@@ -298,7 +314,7 @@ class FakeConnection extends BindingConnection {
       _postData(opener.id, () => opener._onClose(status));
       return;
     }
-    final channel = FakeChannel._(
+    final channel = MemoryBindingChannel._(
       this,
       opener.id,
       isLocallyOpened: false,
@@ -343,7 +359,7 @@ class FakeConnection extends BindingConnection {
     }
   }
 
-  void _releasePayload(FakeChannel channel) {
+  void _releasePayload(MemoryBindingChannel channel) {
     if (_payloads.remove(channel)) {
       _openPayloadBytes -= channel.openPayload.length;
     }
@@ -364,7 +380,7 @@ class FakeConnection extends BindingConnection {
     }
   }
 
-  void _release(FakeChannel channel) {
+  void _release(MemoryBindingChannel channel) {
     if (identical(_channels[channel.id], channel)) {
       _channels.remove(channel.id);
       if (!_undelivered.contains(channel)) _releasePayload(channel);
@@ -705,13 +721,13 @@ class FakeConnection extends BindingConnection {
 
   @override
   String toString() =>
-      'FakeConnection(${isInitiator ? 'initiator' : 'acceptor'}, '
+      'MemoryBindingConnection(${isInitiator ? 'initiator' : 'acceptor'}, '
       '${_channels.length} channels${_closing ? ', closed' : ''})';
 }
 
-/// A channel of the fake binding: a stream of its own.
-class FakeChannel extends MuxChannel {
-  FakeChannel._(
+/// A channel of the memory binding: a stream of its own.
+class MemoryBindingChannel extends MuxChannel {
+  MemoryBindingChannel._(
     this.connection,
     this.id, {
     required this.isLocallyOpened,
@@ -728,11 +744,11 @@ class FakeChannel extends MuxChannel {
       onResume: _scheduleDrain,
       onCancel: _discard,
     );
-    _sink = _FakeSink(this);
+    _sink = _ChannelSink(this);
   }
 
   @override
-  final FakeConnection connection;
+  final MemoryBindingConnection connection;
 
   @override
   final int id;
@@ -743,11 +759,11 @@ class FakeChannel extends MuxChannel {
   @override
   final Uint8List openPayload;
 
-  FakeChannel? _peerChannel;
+  MemoryBindingChannel? _peerChannel;
   late final StreamController<Uint8List> _incoming;
   // Closed by the application through close().
   // ignore: close_sinks
-  late final _FakeSink _sink;
+  late final _ChannelSink _sink;
   final Completer<Status> _done = Completer<Status>();
   MuxChannelState _state = MuxChannelState.open;
   MuxPriority _priority = MuxPriority.normal;
@@ -762,7 +778,7 @@ class FakeChannel extends MuxChannel {
   // openAfter) what it sends waits in [_preOpen].
   bool _opened = false;
   final List<void Function()> _preOpen = [];
-  final Set<FakeChannel> _childrenWaitingOpen = {};
+  final Set<MemoryBindingChannel> _childrenWaitingOpen = {};
 
   // Sending.
   final int _initialSendWindow;
@@ -992,7 +1008,7 @@ class FakeChannel extends MuxChannel {
 
   /// Runs [deliver] on the peer's channel, in order with this channel's
   /// other records, once this channel's open went out.
-  void _toPeer(String kind, void Function(FakeChannel peer) deliver) {
+  void _toPeer(String kind, void Function(MemoryBindingChannel peer) deliver) {
     if (!_opened) {
       _preOpen.add(() => _toPeer(kind, deliver));
       return;
@@ -1021,7 +1037,7 @@ class FakeChannel extends MuxChannel {
     }
   }
 
-  void _postChild(FakeChannel child) {
+  void _postChild(MemoryBindingChannel child) {
     if (_opened) {
       child._postOpen();
     } else {
@@ -1284,7 +1300,7 @@ class FakeChannel extends MuxChannel {
 
   @override
   String toString() =>
-      'FakeChannel($id, ${_state.name}, '
+      'MemoryBindingChannel($id, ${_state.name}, '
       '${isLocallyOpened ? 'local' : 'remote'})';
 }
 
@@ -1293,19 +1309,21 @@ class FakeChannel extends MuxChannel {
 class _Send {
   _Send(this.data, {required this.split}) : opens = null;
 
-  _Send.open(FakeChannel this.opens) : data = Uint8List(0), split = false;
+  _Send.open(MemoryBindingChannel this.opens)
+    : data = Uint8List(0),
+      split = false;
 
   final Uint8List data;
   final bool split;
-  final FakeChannel? opens;
+  final MemoryBindingChannel? opens;
   int offset = 0;
   final Completer<void> completer = Completer<void>()..future.ignore();
 }
 
-class _FakeSink implements StreamSink<Uint8List> {
-  _FakeSink(this._channel);
+class _ChannelSink implements StreamSink<Uint8List> {
+  _ChannelSink(this._channel);
 
-  final FakeChannel _channel;
+  final MemoryBindingChannel _channel;
   bool _closed = false;
 
   @override
@@ -1370,40 +1388,40 @@ bool _equal(List<int> a, List<int> b) {
   return true;
 }
 
-/// A fake listener: a node adopting the connections dialled to it.
-class _FakeListener {
-  _FakeListener(this.node, this.policy);
+/// A listener: a node adopting the connections dialled to it.
+class _Listener {
+  _Listener(this.node, this.policy);
 
   final Switchboard node;
   final ChannelPolicy? policy;
 }
 
-/// The [SwitchboardBinding] of `fake://name` endpoints: the listeners of
-/// this isolate started with [listen], each adopting the connections
-/// dialled to it into its node ([Switchboard.adopt]).
-class FakeBinding extends SwitchboardBinding {
-  FakeBinding({this.controlDelay = Duration.zero});
+/// The [SwitchboardBinding] of `membinding://name` endpoints: the
+/// listeners of this isolate started with [listen], each adopting the
+/// connections dialled to it into its node ([Switchboard.adopt]).
+class MemoryBinding extends SwitchboardBinding {
+  MemoryBinding({this.controlDelay = Duration.zero});
 
-  /// The scheme of the fake binding's endpoints.
-  static const String scheme = 'fake';
+  /// The scheme of the memory binding's endpoints.
+  static const String scheme = 'membinding';
 
-  static final Map<String, _FakeListener> _listeners = {};
+  static final Map<String, _Listener> _listeners = {};
 
   /// How much later than channel records control records arrive on the
   /// connections this binding dials.
   final Duration controlDelay;
 
   /// Every connection this binding dialled, initiator side.
-  final List<FakeConnection> dialled = [];
+  final List<MemoryBindingConnection> dialled = [];
 
-  /// Has [node] accept the connections dialled to `fake://[name]`, under
-  /// [policy], until [stop].
+  /// Has [node] accept the connections dialled to `membinding://[name]`,
+  /// under [policy], until [stop].
   static Uri listen(Switchboard node, String name, {ChannelPolicy? policy}) {
-    _listeners[name] = _FakeListener(node, policy);
+    _listeners[name] = _Listener(node, policy);
     return Uri(scheme: scheme, host: name);
   }
 
-  /// Stops the listener at `fake://[name]`.
+  /// Stops the listener at `membinding://[name]`.
   static void stop(String name) => _listeners.remove(name);
 
   @override
@@ -1415,10 +1433,10 @@ class FakeBinding extends SwitchboardBinding {
     if (listener == null) {
       throw SwitchboardException.of(
         StatusCode.unavailable,
-        'no fake listener at $endpoint',
+        'no listener at $endpoint',
       );
     }
-    final (local, remote) = FakeConnection.pair(
+    final (local, remote) = MemoryBindingConnection.pair(
       initiator: settings.options,
       acceptor: listener.node.muxOptions,
       controlDelay: controlDelay,
@@ -1427,7 +1445,7 @@ class FakeBinding extends SwitchboardBinding {
     await listener.node.adopt(
       remote,
       policy: listener.policy,
-      remote: 'fake peer',
+      remote: 'memory binding peer',
     );
     dialled.add(local);
     return local;

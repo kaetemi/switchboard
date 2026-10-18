@@ -1241,7 +1241,7 @@ void main() {
         SwitchboardException.of(StatusCode.unavailable, 'not ready');
 
     /// Refuses the first [refusals] ASSIGNs, recording when each arrived
-    /// (ms of fake time) in [at].
+    /// (ms of virtual time) in [at].
     Future<AssignResponse> Function(AssignRequest) refusing(
       FakeAsync async,
       List<int> at, {
@@ -1530,7 +1530,7 @@ void main() {
 
   group('RESUME after a rollback', () {
     /// Two zone instances, 1 owning slot 1, 2 refusing every ASSIGN, at
-    /// 100 ms of fake time. The RESUMEs 1 gets are timed in [at] (ms);
+    /// 100 ms of virtual time. The RESUMEs 1 gets are timed in [at] (ms);
     /// [answerFrom] is the attempt (1 = the first) from which it answers
     /// them.
     (Instance, Instance) zones(

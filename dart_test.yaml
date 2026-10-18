@@ -6,7 +6,7 @@
 # reconnecting client, which is meant for web frontends, the identity
 # tests (credentials, Ed25519 in pure Dart, the NONCE/IDENT handshake), and
 # the item windows of Talk stream requests (u32 windows and credits up to
-# their bound, and the timeouts and credit bound in fake time, long ones
+# their bound, and the timeouts and credit bound in virtual time, long ones
 # armed in steps a JavaScript timer takes).
 presets:
   node:

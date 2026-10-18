@@ -737,9 +737,9 @@ void main() {
   });
 
   group('idle timeout', () {
-    /// A Talk channel and its far end over [muxPair], in fake time, the
+    /// A Talk channel and its far end over [muxPair], in virtual time, the
     /// bulk channels of both sides routed; then a function closing both.
-    (TalkChannel, TalkChannel, void Function()) fakeTalk(
+    (TalkChannel, TalkChannel, void Function()) routedTalkPair(
       FakeAsync async, {
       TalkOptions near = const TalkOptions(),
       TalkOptions far = const TalkOptions(),
@@ -795,7 +795,7 @@ void main() {
     test('a request whose bulk payload stalls is answered DEADLINE_EXCEEDED '
         'once no byte came for the timeout', () {
       fakeAsync((async) {
-        final (talk, server, close) = fakeTalk(
+        final (talk, server, close) = routedTalkPair(
           async,
           near: const TalkOptions(bulkChunkSize: 500),
         );
@@ -834,7 +834,7 @@ void main() {
 
     test('a final response whose payload stalls fails its request', () {
       fakeAsync((async) {
-        final (talk, server, close) = fakeTalk(async);
+        final (talk, server, close) = routedTalkPair(async);
         final source = StreamController<List<int>>();
         late Future<void> sent;
         server.messages.listen((m) => sent = m.replyBulk(source.stream));
@@ -859,7 +859,7 @@ void main() {
     test('an item whose payload stalls ends its stream', () {
       fakeAsync((async) {
         // The responder's own timeout would end the request first.
-        final (talk, server, close) = fakeTalk(
+        final (talk, server, close) = routedTalkPair(
           async,
           far: const TalkOptions(replyTimeout: Duration.zero),
         );
@@ -886,7 +886,7 @@ void main() {
 
     test('a plain message whose payload stalls is dropped', () {
       fakeAsync((async) {
-        final (talk, server, close) = fakeTalk(async);
+        final (talk, server, close) = routedTalkPair(async);
         final seen = <TalkMessage>[];
         talk.messages.listen(seen.add);
         final source = StreamController<List<int>>();
@@ -905,7 +905,7 @@ void main() {
 
     test('a streamed payload the application reads errors', () {
       fakeAsync((async) {
-        final (talk, server, close) = fakeTalk(
+        final (talk, server, close) = routedTalkPair(
           async,
           near: TalkOptions(streamBulk: (_) => true),
         );
@@ -928,7 +928,7 @@ void main() {
 
     test('a payload waiting for its reader here does not time out', () {
       fakeAsync((async) {
-        final (talk, server, close) = fakeTalk(
+        final (talk, server, close) = routedTalkPair(
           async,
           near: TalkOptions(streamBulk: (_) => true),
         );
@@ -965,7 +965,7 @@ void main() {
     test('a payload waiting for the reassembly budget does not time out; '
         'once admitted, the timeout counts from then', () {
       fakeAsync((async) {
-        final (talk, server, close) = fakeTalk(
+        final (talk, server, close) = routedTalkPair(
           async,
           near: const TalkOptions(reassemblyBudget: 1000),
           far: const TalkOptions(bulkThreshold: 100),
@@ -999,12 +999,12 @@ void main() {
         'nor timed out', () {
       fakeAsync((async) {
         final piping = TalkOptions(streamBulk: (_) => true);
-        final (client, front, closeFront) = fakeTalk(
+        final (client, front, closeFront) = routedTalkPair(
           async,
           near: piping,
           far: piping,
         );
-        final (back, backend, closeBack) = fakeTalk(async, near: piping);
+        final (back, backend, closeBack) = routedTalkPair(async, near: piping);
         front.messages.listen((m) => forwardMessage(m, back).ignore());
         backend.messages.listen(
           (m) => m
@@ -1038,7 +1038,7 @@ void main() {
 
     test('an unclaimed bulk channel goes idle too', () {
       fakeAsync((async) {
-        final (talk, server, close) = fakeTalk(
+        final (talk, server, close) = routedTalkPair(
           async,
           near: const TalkOptions(bulkOpenTimeout: Duration(minutes: 1)),
         );
@@ -1079,7 +1079,7 @@ void main() {
 
     test('Duration.zero sets no idle timeout', () {
       fakeAsync((async) {
-        final (talk, server, close) = fakeTalk(
+        final (talk, server, close) = routedTalkPair(
           async,
           near: const TalkOptions(bulkChunkSize: 500),
           far: const TalkOptions(bulkIdleTimeout: Duration.zero),

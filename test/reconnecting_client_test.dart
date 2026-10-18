@@ -21,12 +21,13 @@ import 'package:stream_channel/stream_channel.dart';
 import 'package:switchboard/core.dart';
 import 'package:test/test.dart';
 
-/// Keep-alive off so that the fake clock only sees the timers under test.
+/// Keep-alive off so that the virtual clock only sees the timers under
+/// test.
 ///
 /// `keepAliveTimeout` also bounds how long `MuxConnection.close` waits for
 /// the transport. Under fake_async that wait always runs out: cancelling
 /// the subscription of a finished stream returns a future of the root zone,
-/// whose microtasks the fake clock does not run. Keep it short.
+/// whose microtasks fake_async does not run. Keep it short.
 const quiet = MuxOptions(
   keepAliveInterval: null,
   keepAliveTimeout: Duration(milliseconds: 100),
@@ -42,8 +43,8 @@ final feed = ChannelAddress(type: Name('feed'));
 
 /// The endpoint side: every transport the connector creates is accepted by
 /// a mux connection here, unless the endpoint is told to refuse.
-class FakeEndpoint {
-  FakeEndpoint(this.async, {this.options = quiet});
+class ScriptedEndpoint {
+  ScriptedEndpoint(this.async, {this.options = quiet});
 
   final FakeAsync async;
 
@@ -52,7 +53,7 @@ class FakeEndpoint {
   final List<MuxConnection> connections = [];
   final List<IncomingChannel> channels = [];
 
-  /// Fake time of every connector call.
+  /// Virtual time of every connector call.
   final List<Duration> attempts = [];
 
   /// The next this many connector calls fail.
@@ -112,7 +113,7 @@ class FakeEndpoint {
 }
 
 ReconnectingClient clientFor(
-  FakeEndpoint endpoint, {
+  ScriptedEndpoint endpoint, {
   Duration initialBackoff = const Duration(milliseconds: 500),
   Duration maxBackoff = const Duration(seconds: 30),
   double jitter = 0,
@@ -178,7 +179,7 @@ void main() {
   group('connecting', () {
     test('connects and reports its states', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async);
+        final endpoint = ScriptedEndpoint(async);
         final client = clientFor(endpoint);
         expect(client.state.phase, ClientPhase.connecting);
         expect(client.state.attempt, 1);
@@ -239,7 +240,7 @@ void main() {
 
     test('autoStart false waits for start()', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async);
+        final endpoint = ScriptedEndpoint(async);
         final client = clientFor(endpoint, autoStart: false);
         async.elapse(const Duration(seconds: 5));
         expect(endpoint.attempts, isEmpty);
@@ -287,7 +288,7 @@ void main() {
   group('backoff', () {
     test('doubles from the initial delay up to the cap', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async)..refuseAll = true;
+        final endpoint = ScriptedEndpoint(async)..refuseAll = true;
         final client = clientFor(endpoint, maxBackoff: ms(4000));
         final states = <ClientState>[];
         client.states.listen(states.add);
@@ -324,7 +325,7 @@ void main() {
 
     test('jitter stays within its bounds', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async)..refuseAll = true;
+        final endpoint = ScriptedEndpoint(async)..refuseAll = true;
         final client = clientFor(
           endpoint,
           maxBackoff: ms(4000),
@@ -351,7 +352,7 @@ void main() {
 
     test('resets after a connection that outlived the cap', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async)..failures = 3;
+        final endpoint = ScriptedEndpoint(async)..failures = 3;
         final client = clientFor(endpoint, maxBackoff: ms(8000));
         // Fails at 0, 0.5 and 1.5 s; connects at 3.5 s.
         async.elapse(ms(3500));
@@ -375,7 +376,7 @@ void main() {
 
     test('a throwing, failing or hanging connector is retried', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async);
+        final endpoint = ScriptedEndpoint(async);
         final late = Completer<StreamChannel<Uint8List>>();
         var calls = 0;
         Future<StreamChannel<Uint8List>> connect() {
@@ -437,7 +438,7 @@ void main() {
   group('openChannel', () {
     test('waits for the connection, with defaultPayload attached', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async);
+        final endpoint = ScriptedEndpoint(async);
         final client = clientFor(
           endpoint,
           autoStart: false,
@@ -470,7 +471,7 @@ void main() {
 
     test('fails with UNAVAILABLE after openTimeout, CANCELLED on close', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async)..refuseAll = true;
+        final endpoint = ScriptedEndpoint(async)..refuseAll = true;
         final client = clientFor(endpoint);
         final timed = Outcome(
           client.openChannel(events, openTimeout: ms(3000)),
@@ -502,7 +503,7 @@ void main() {
 
     test('a Talk request through openTalk', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async)
+        final endpoint = ScriptedEndpoint(async)
           ..onChannel = (incoming) {
             incoming.talk().messages.listen((message) {
               message.reply(bytes([...message.payload, 2]), procedure: 'PONG');
@@ -525,7 +526,7 @@ void main() {
   group('bulk payloads', () {
     test('both ways through openTalk', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async)
+        final endpoint = ScriptedEndpoint(async)
           ..onChannel = (incoming) {
             incoming.talk().messages.listen((message) {
               message.reply(
@@ -554,7 +555,7 @@ void main() {
   group('persistent channels', () {
     test('re-opened after the endpoint drops the connection', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async);
+        final endpoint = ScriptedEndpoint(async);
         final client = clientFor(endpoint);
         final opened = <MuxChannel>[];
         final closed = <Status>[];
@@ -619,7 +620,7 @@ void main() {
 
     test('closed by the endpoint: re-opened after the backoff', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async);
+        final endpoint = ScriptedEndpoint(async);
         final client = clientFor(endpoint, maxBackoff: ms(4000));
         final opened = <MuxChannel>[];
         final closed = <Status>[];
@@ -673,7 +674,7 @@ void main() {
     ]) {
       test('closed by the endpoint with ${code.name}: stays closed', () {
         fakeAsync((async) {
-          final endpoint = FakeEndpoint(async);
+          final endpoint = ScriptedEndpoint(async);
           final client = clientFor(endpoint);
           final opened = <MuxChannel>[];
           final closed = <Status>[];
@@ -711,7 +712,7 @@ void main() {
 
     test('onOpen exceptions are logged and do not affect others', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async);
+        final endpoint = ScriptedEndpoint(async);
         final client = clientFor(endpoint);
         final opened = <String>[];
         client.openPersistent(events, (_) {
@@ -735,7 +736,7 @@ void main() {
 
     test('PersistentTalk re-sends its subscription on every connection', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async);
+        final endpoint = ScriptedEndpoint(async);
         var subscriptions = 0;
         endpoint.onChannel = (incoming) {
           final talk = incoming.talk();
@@ -784,7 +785,7 @@ void main() {
 
     test('opened while connected, and on the next connection', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async)..failures = 1;
+        final endpoint = ScriptedEndpoint(async)..failures = 1;
         final client = clientFor(endpoint, defaultPayload: bytes([7]));
         final opened = <MuxChannel>[];
         client.openPersistent(events, opened.add);
@@ -816,7 +817,7 @@ void main() {
   group('stop and close', () {
     test('a connector that closes the client leaves no timeout behind', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async);
+        final endpoint = ScriptedEndpoint(async);
         late ReconnectingClient client;
         client = clientFor(
           endpoint,
@@ -835,7 +836,7 @@ void main() {
 
     test('stop() sends GOAWAY and stops reconnecting; start() resumes', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async);
+        final endpoint = ScriptedEndpoint(async);
         final client = clientFor(endpoint);
         final opened = <MuxChannel>[];
         final closed = <Status>[];
@@ -877,7 +878,7 @@ void main() {
 
     test('stop() during a connection attempt discards its transport', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async);
+        final endpoint = ScriptedEndpoint(async);
         final pending = Completer<StreamChannel<Uint8List>>();
         final client = clientFor(endpoint, connect: () => pending.future);
         client.stop();
@@ -893,7 +894,7 @@ void main() {
 
     test('close() waits for the application channels within the grace', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async);
+        final endpoint = ScriptedEndpoint(async);
         final client = clientFor(endpoint);
         final own = Outcome(client.openChannel(events));
         async.flushMicrotasks();
@@ -913,7 +914,7 @@ void main() {
 
     test('close() while waiting for the next attempt', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async)..refuseAll = true;
+        final endpoint = ScriptedEndpoint(async)..refuseAll = true;
         final client = clientFor(endpoint);
         final persistent = client.openPersistent(events, (_) {});
         async.elapse(ms(700));
@@ -931,7 +932,7 @@ void main() {
   group('GOAWAY from the endpoint', () {
     test('persistent channels move to a new connection at once', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async);
+        final endpoint = ScriptedEndpoint(async);
         var subscriptions = 0;
         endpoint.onChannel = (incoming) {
           if (incoming.address.type != Name('feed')) {
@@ -1029,7 +1030,7 @@ void main() {
 
     test('on an idle connection: reconnects at once', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async);
+        final endpoint = ScriptedEndpoint(async);
         final client = clientFor(endpoint);
         async.flushMicrotasks();
         final first = client.connection!;
@@ -1057,7 +1058,7 @@ void main() {
 
     test('an application channel carries on over the old connection', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async);
+        final endpoint = ScriptedEndpoint(async);
         final client = clientFor(endpoint);
         final own = Outcome(client.openChannel(feed));
         async.flushMicrotasks();
@@ -1112,7 +1113,7 @@ void main() {
     test('close() bounds an old connection held by the application', () {
       fakeAsync((async) {
         // The endpoint would wait long; close() waits the client's grace.
-        final endpoint = FakeEndpoint(
+        final endpoint = ScriptedEndpoint(
           async,
           options: quiet.copyWith(goAwayGrace: const Duration(minutes: 10)),
         );
@@ -1133,7 +1134,7 @@ void main() {
     for (final how in ['stop', 'close']) {
       test('arriving during $how(): no reconnect', () {
         fakeAsync((async) {
-          final endpoint = FakeEndpoint(async);
+          final endpoint = ScriptedEndpoint(async);
           final client = clientFor(endpoint);
           final closed = <Status>[];
           client.openPersistent(events, (_) {}, onClosed: closed.add);
@@ -1173,7 +1174,7 @@ void main() {
 
     test('stop() during the attempt that follows it', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async);
+        final endpoint = ScriptedEndpoint(async);
         final pending = Completer<StreamChannel<Uint8List>>();
         var calls = 0;
         final client = clientFor(
@@ -1203,7 +1204,7 @@ void main() {
 
     test('a failed attempt after it backs off as usual', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async);
+        final endpoint = ScriptedEndpoint(async);
         final client = clientFor(endpoint);
         final opened = <MuxChannel>[];
         client.openPersistent(events, opened.add);
@@ -1235,7 +1236,7 @@ void main() {
 
     test('again soon after reconnecting at once: backs off', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async);
+        final endpoint = ScriptedEndpoint(async);
         final client = clientFor(endpoint, maxBackoff: ms(8000));
         async.elapse(ms(1000));
         unawaited(endpoint.last.goAway());
@@ -1267,7 +1268,7 @@ void main() {
   group('next attempt', () {
     test('nextAttemptAt matches the backoff schedule', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async)..refuseAll = true;
+        final endpoint = ScriptedEndpoint(async)..refuseAll = true;
         final client = clientFor(
           endpoint,
           maxBackoff: ms(4000),
@@ -1287,8 +1288,8 @@ void main() {
         for (var i = 0; i + 1 < times.length; i++) {
           final at = waits[i].nextAttemptAt;
           expect(at, isNotNull);
-          // The wall clock is not faked: compare the delays. On the web a
-          // DateTime holds milliseconds.
+          // The wall clock does not follow virtual time: compare the
+          // delays. On the web a DateTime holds milliseconds.
           final scheduled = at!.difference(waits[i].since!);
           final gap = times[i + 1] - times[i];
           expect((scheduled - gap).inMicroseconds.abs(), lessThan(1000));
@@ -1306,7 +1307,7 @@ void main() {
 
     test('null while connecting, connected or stopped', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async);
+        final endpoint = ScriptedEndpoint(async);
         final client = clientFor(endpoint);
         expect(client.state.phase, ClientPhase.connecting);
         expect(client.nextAttemptAt, isNull);
@@ -1380,7 +1381,7 @@ void main() {
   group('reconnectNow', () {
     test('during the backoff: attempts at once', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async)..refuseAll = true;
+        final endpoint = ScriptedEndpoint(async)..refuseAll = true;
         final client = clientFor(endpoint);
         final states = <ClientState>[];
         client.states.listen(states.add);
@@ -1437,7 +1438,7 @@ void main() {
 
     test('while connecting or connected: does nothing', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async);
+        final endpoint = ScriptedEndpoint(async);
         final pending = Completer<StreamChannel<Uint8List>>();
         var calls = 0;
         final client = clientFor(
@@ -1474,7 +1475,7 @@ void main() {
 
     test('force while connected: moves to a new connection', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async);
+        final endpoint = ScriptedEndpoint(async);
         var subscriptions = 0;
         endpoint.onChannel = (incoming) {
           if (incoming.address.type != Name('feed')) {
@@ -1573,7 +1574,7 @@ void main() {
 
     test('force: a failed attempt backs off as usual', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async);
+        final endpoint = ScriptedEndpoint(async);
         final client = clientFor(endpoint);
         final opened = <MuxChannel>[];
         client.openPersistent(events, opened.add);
@@ -1596,7 +1597,7 @@ void main() {
 
     test('not started, stopped or closed: does nothing', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async);
+        final endpoint = ScriptedEndpoint(async);
         final client = clientFor(endpoint, autoStart: false);
         client.reconnectNow();
         client.reconnectNow(force: true);
@@ -1639,7 +1640,7 @@ void main() {
   group('the endpoint', () {
     test('pushed channels arrive on incoming across reconnects', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async);
+        final endpoint = ScriptedEndpoint(async);
         final client = clientFor(endpoint);
         final pushed = <IncomingChannel>[];
         client.incoming.listen((incoming) {
@@ -1689,7 +1690,7 @@ void main() {
 
     test('pushed channels are refused once incoming is cancelled', () {
       fakeAsync((async) {
-        final endpoint = FakeEndpoint(async);
+        final endpoint = ScriptedEndpoint(async);
         final client = clientFor(endpoint);
         final pushed = <IncomingChannel>[];
         final subscription = client.incoming.listen(pushed.add);
