@@ -24,12 +24,12 @@ import 'package:test/test.dart';
 
 import 'binding_bulk_test.dart' show Receiver, bulkMessage, bulkOpen;
 import 'binding_seam_test.dart' as h;
-import 'memory_binding.dart';
+import 'inproc_binding.dart';
 
 void main() {
   test('a parent waiting for a referenced bulk channel after its graceful '
       'close is held until the channel arrived and ended', () async {
-    final (a, b) = MemoryBindingConnection.pair(
+    final (a, b) = InProcessConnection.pair(
       initiator: h.fast,
       acceptor: h.fast,
     );
@@ -55,7 +55,7 @@ void main() {
   });
 
   test('a parent closed with nothing referenced is not held', () async {
-    final (a, b) = MemoryBindingConnection.pair(
+    final (a, b) = InProcessConnection.pair(
       initiator: h.fast,
       acceptor: h.fast,
     );
@@ -73,7 +73,7 @@ void main() {
   test('holds end with their wait, and at most the bound of lingering '
       'parents is held per connection', () {
     fakeAsync((clock) {
-      final (a, b) = MemoryBindingConnection.pair(
+      final (a, b) = InProcessConnection.pair(
         initiator: h.fast,
         acceptor: h.fast,
       );

@@ -15,13 +15,13 @@ import 'package:switchboard/switchboard.dart';
 import 'package:test/test.dart';
 
 import 'binding_seam_test.dart' as h;
-import 'memory_binding.dart';
+import 'inproc_binding.dart';
 
-(MemoryBindingConnection, MemoryBindingConnection) pair({
+(InProcessConnection, InProcessConnection) pair({
   MuxOptions? options,
   Duration Function(int)? delay,
 }) {
-  final (a, b) = MemoryBindingConnection.pair(
+  final (a, b) = InProcessConnection.pair(
     initiator: options ?? h.fast,
     acceptor: options ?? h.fast,
     channelDelay: delay,
@@ -50,7 +50,7 @@ void main() {
   group('independent channel streams', () {
     test('bulk opens waiting for unknown parents expire', () {
       fakeAsync((clock) {
-        final (a, b) = MemoryBindingConnection.pair(
+        final (a, b) = InProcessConnection.pair(
           initiator: h.fast,
           acceptor: h.fast,
         );
@@ -82,7 +82,7 @@ void main() {
         final proxy = h.node(resolver: resolver);
         proxy.catchAll = proxyHandler(proxy, maxChannelsPerConnection: 2);
         final endpoint = h.listen(proxy, 'review-proxy-bound');
-        final client = h.node(bindings: [MemoryBinding()]);
+        final client = h.node(bindings: [InProcessBinding()]);
         final parent = await client.openChannelAt(
           endpoint,
           ChannelAddress(type: h.echo),
@@ -293,7 +293,7 @@ void main() {
     });
   });
 
-  group('memory binding flow and lifetime', () {
+  group('in-process binding flow and lifetime', () {
     test(
       'empty subframes stall a stopped reader and resume on consumption',
       () async {
@@ -444,7 +444,7 @@ void main() {
       var calls = 0;
       final binding = DialBinding((_, settings) async {
         calls++;
-        final (a, b) = MemoryBindingConnection.pair(
+        final (a, b) = InProcessConnection.pair(
           initiator: settings.options,
           acceptor: server.muxOptions,
         );
@@ -567,7 +567,7 @@ void main() {
         BindingDialSettings? seenSettings;
         final binding = DialBinding((_, settings) async {
           seenSettings = settings;
-          final (a, b) = MemoryBindingConnection.pair(
+          final (a, b) = InProcessConnection.pair(
             initiator: settings.options,
             acceptor: server.muxOptions,
           );
@@ -626,7 +626,7 @@ void main() {
       ]);
       addTearDown(resolver.close);
       final relay = h.node(
-        bindings: [MemoryBinding()],
+        bindings: [InProcessBinding()],
         resolver: resolver,
         verifier: verifier,
       );
@@ -637,7 +637,7 @@ void main() {
       final relayEndpoint = h.listen(relay, 'review-relay');
       final client = h.node(
         bindings: [
-          MemoryBinding(controlDelay: const Duration(milliseconds: 50)),
+          InProcessBinding(controlDelay: const Duration(milliseconds: 50)),
         ],
         credential: credential,
         identifyOutgoing: false,

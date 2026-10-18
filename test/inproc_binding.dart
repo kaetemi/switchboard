@@ -8,16 +8,17 @@ Authors:
   GPT-6 Astra <noreply@openai.com>
 */
 
-// An in-memory binding of the connection contract, for the tests of the
+// The in-process binding of the connection contract, for the tests of the
 // seam: there is no mux frame anywhere. Each channel is a "stream" whose
 // records (its open, its subframes, credit, its close) go to the peer's
 // channel object through an in-process wire, in order per stream, the way a
 // QUIC stream carries them; the connection's control messages (PING, PONG,
 // GOAWAY, NONCE, IDENT) go on a control "stream" of their own, which may
-// be slower than the channels ([MemoryBindingConnection.pair]'s
+// be slower than the channels ([InProcessConnection.pair]'s
 // `controlDelay`), as the streams of a QUIC connection are not ordered with
-// each other. Its scheme is `membinding`, distinct from the node's own
-// in-process `mem://` endpoints, whose connections run the frame mux. Flow
+// each other. Its scheme is `inproc`, distinct from the node's `mem://`
+// endpoints, whose connections run the frame mux over an in-memory
+// transport. Flow
 // control counts payload bytes plus one byte per record (empty records
 // must be bounded too), the windows are the [MuxOptions.initialWindow] of
 // each side, known to the other from the start (as QUIC's transport
@@ -66,10 +67,10 @@ class _Ident extends _Control {
 /// The end of the connection, after everything sent before it.
 class _Closed extends _Control {}
 
-/// A connection of the memory binding. Make one with
-/// [MemoryBindingConnection.pair].
-class MemoryBindingConnection extends BindingConnection {
-  MemoryBindingConnection._(
+/// A connection of the in-process binding. Make one with
+/// [InProcessConnection.pair].
+class InProcessConnection extends BindingConnection {
+  InProcessConnection._(
     this.isInitiator,
     this.options,
     this.controlDelay,
@@ -85,19 +86,19 @@ class MemoryBindingConnection extends BindingConnection {
 
   /// Two connected sides: the initiator and the acceptor. Control records
   /// take [controlDelay] longer than channel records.
-  static (MemoryBindingConnection, MemoryBindingConnection) pair({
+  static (InProcessConnection, InProcessConnection) pair({
     MuxOptions initiator = const MuxOptions(),
     MuxOptions acceptor = const MuxOptions(),
     Duration controlDelay = Duration.zero,
     Duration Function(int id)? channelDelay,
   }) {
-    final a = MemoryBindingConnection._(
+    final a = InProcessConnection._(
       true,
       initiator,
       controlDelay,
       channelDelay,
     );
-    final b = MemoryBindingConnection._(
+    final b = InProcessConnection._(
       false,
       acceptor,
       controlDelay,
@@ -121,12 +122,11 @@ class MemoryBindingConnection extends BindingConnection {
   /// channels may overtake one another; records of one channel cannot.
   final Duration Function(int id)? channelDelay;
 
-  late final MemoryBindingConnection _peer;
+  late final InProcessConnection _peer;
   late final StreamController<MuxChannel> _incoming;
-  final Map<int, MemoryBindingChannel> _channels = {};
-  final Queue<MemoryBindingChannel> _undelivered =
-      Queue<MemoryBindingChannel>();
-  final Set<MemoryBindingChannel> _payloads = {};
+  final Map<int, InProcessChannel> _channels = {};
+  final Queue<InProcessChannel> _undelivered = Queue<InProcessChannel>();
+  final Set<InProcessChannel> _payloads = {};
   int _openPayloadBytes = 0;
   bool _incomingScheduled = false;
   final Completer<Status> _done = Completer<Status>();
@@ -238,7 +238,7 @@ class MemoryBindingConnection extends BindingConnection {
   MuxChannel open(Uint8List openPayload) =>
       _openLocal(openPayload, continuation: false).._postOpen();
 
-  MemoryBindingChannel _openLocal(
+  InProcessChannel _openLocal(
     Uint8List openPayload, {
     required bool continuation,
   }) {
@@ -274,7 +274,7 @@ class MemoryBindingConnection extends BindingConnection {
     }
     final id = _nextId;
     _nextId += 2;
-    final channel = MemoryBindingChannel._(
+    final channel = InProcessChannel._(
       this,
       id,
       isLocallyOpened: true,
@@ -287,7 +287,7 @@ class MemoryBindingConnection extends BindingConnection {
   }
 
   /// The peer opened [opener].
-  void _onOpen(MemoryBindingChannel opener) {
+  void _onOpen(InProcessChannel opener) {
     Status? rejection;
     if (_goAwaySent && !_continuesOpenChannel(opener.openPayload)) {
       rejection = Status.of(StatusCode.goingAway);
@@ -314,7 +314,7 @@ class MemoryBindingConnection extends BindingConnection {
       _postData(opener.id, () => opener._onClose(status));
       return;
     }
-    final channel = MemoryBindingChannel._(
+    final channel = InProcessChannel._(
       this,
       opener.id,
       isLocallyOpened: false,
@@ -359,7 +359,7 @@ class MemoryBindingConnection extends BindingConnection {
     }
   }
 
-  void _releasePayload(MemoryBindingChannel channel) {
+  void _releasePayload(InProcessChannel channel) {
     if (_payloads.remove(channel)) {
       _openPayloadBytes -= channel.openPayload.length;
     }
@@ -380,7 +380,7 @@ class MemoryBindingConnection extends BindingConnection {
     }
   }
 
-  void _release(MemoryBindingChannel channel) {
+  void _release(InProcessChannel channel) {
     if (identical(_channels[channel.id], channel)) {
       _channels.remove(channel.id);
       if (!_undelivered.contains(channel)) _releasePayload(channel);
@@ -721,13 +721,13 @@ class MemoryBindingConnection extends BindingConnection {
 
   @override
   String toString() =>
-      'MemoryBindingConnection(${isInitiator ? 'initiator' : 'acceptor'}, '
+      'InProcessConnection(${isInitiator ? 'initiator' : 'acceptor'}, '
       '${_channels.length} channels${_closing ? ', closed' : ''})';
 }
 
-/// A channel of the memory binding: a stream of its own.
-class MemoryBindingChannel extends MuxChannel {
-  MemoryBindingChannel._(
+/// A channel of the in-process binding: a stream of its own.
+class InProcessChannel extends MuxChannel {
+  InProcessChannel._(
     this.connection,
     this.id, {
     required this.isLocallyOpened,
@@ -748,7 +748,7 @@ class MemoryBindingChannel extends MuxChannel {
   }
 
   @override
-  final MemoryBindingConnection connection;
+  final InProcessConnection connection;
 
   @override
   final int id;
@@ -759,7 +759,7 @@ class MemoryBindingChannel extends MuxChannel {
   @override
   final Uint8List openPayload;
 
-  MemoryBindingChannel? _peerChannel;
+  InProcessChannel? _peerChannel;
   late final StreamController<Uint8List> _incoming;
   // Closed by the application through close().
   // ignore: close_sinks
@@ -778,7 +778,7 @@ class MemoryBindingChannel extends MuxChannel {
   // openAfter) what it sends waits in [_preOpen].
   bool _opened = false;
   final List<void Function()> _preOpen = [];
-  final Set<MemoryBindingChannel> _childrenWaitingOpen = {};
+  final Set<InProcessChannel> _childrenWaitingOpen = {};
 
   // Sending.
   final int _initialSendWindow;
@@ -1008,7 +1008,7 @@ class MemoryBindingChannel extends MuxChannel {
 
   /// Runs [deliver] on the peer's channel, in order with this channel's
   /// other records, once this channel's open went out.
-  void _toPeer(String kind, void Function(MemoryBindingChannel peer) deliver) {
+  void _toPeer(String kind, void Function(InProcessChannel peer) deliver) {
     if (!_opened) {
       _preOpen.add(() => _toPeer(kind, deliver));
       return;
@@ -1037,7 +1037,7 @@ class MemoryBindingChannel extends MuxChannel {
     }
   }
 
-  void _postChild(MemoryBindingChannel child) {
+  void _postChild(InProcessChannel child) {
     if (_opened) {
       child._postOpen();
     } else {
@@ -1300,7 +1300,7 @@ class MemoryBindingChannel extends MuxChannel {
 
   @override
   String toString() =>
-      'MemoryBindingChannel($id, ${_state.name}, '
+      'InProcessChannel($id, ${_state.name}, '
       '${isLocallyOpened ? 'local' : 'remote'})';
 }
 
@@ -1309,13 +1309,11 @@ class MemoryBindingChannel extends MuxChannel {
 class _Send {
   _Send(this.data, {required this.split}) : opens = null;
 
-  _Send.open(MemoryBindingChannel this.opens)
-    : data = Uint8List(0),
-      split = false;
+  _Send.open(InProcessChannel this.opens) : data = Uint8List(0), split = false;
 
   final Uint8List data;
   final bool split;
-  final MemoryBindingChannel? opens;
+  final InProcessChannel? opens;
   int offset = 0;
   final Completer<void> completer = Completer<void>()..future.ignore();
 }
@@ -1323,7 +1321,7 @@ class _Send {
 class _ChannelSink implements StreamSink<Uint8List> {
   _ChannelSink(this._channel);
 
-  final MemoryBindingChannel _channel;
+  final InProcessChannel _channel;
   bool _closed = false;
 
   @override
@@ -1396,14 +1394,14 @@ class _Listener {
   final ChannelPolicy? policy;
 }
 
-/// The [SwitchboardBinding] of `membinding://name` endpoints: the
+/// The [SwitchboardBinding] of `inproc://name` endpoints: the
 /// listeners of this isolate started with [listen], each adopting the
 /// connections dialled to it into its node ([Switchboard.adopt]).
-class MemoryBinding extends SwitchboardBinding {
-  MemoryBinding({this.controlDelay = Duration.zero});
+class InProcessBinding extends SwitchboardBinding {
+  InProcessBinding({this.controlDelay = Duration.zero});
 
-  /// The scheme of the memory binding's endpoints.
-  static const String scheme = 'membinding';
+  /// The scheme of the in-process binding's endpoints.
+  static const String scheme = 'inproc';
 
   static final Map<String, _Listener> _listeners = {};
 
@@ -1412,16 +1410,16 @@ class MemoryBinding extends SwitchboardBinding {
   final Duration controlDelay;
 
   /// Every connection this binding dialled, initiator side.
-  final List<MemoryBindingConnection> dialled = [];
+  final List<InProcessConnection> dialled = [];
 
-  /// Has [node] accept the connections dialled to `membinding://[name]`,
+  /// Has [node] accept the connections dialled to `inproc://[name]`,
   /// under [policy], until [stop].
   static Uri listen(Switchboard node, String name, {ChannelPolicy? policy}) {
     _listeners[name] = _Listener(node, policy);
     return Uri(scheme: scheme, host: name);
   }
 
-  /// Stops the listener at `membinding://[name]`.
+  /// Stops the listener at `inproc://[name]`.
   static void stop(String name) => _listeners.remove(name);
 
   @override
@@ -1436,7 +1434,7 @@ class MemoryBinding extends SwitchboardBinding {
         'no listener at $endpoint',
       );
     }
-    final (local, remote) = MemoryBindingConnection.pair(
+    final (local, remote) = InProcessConnection.pair(
       initiator: settings.options,
       acceptor: listener.node.muxOptions,
       controlDelay: controlDelay,
@@ -1445,7 +1443,7 @@ class MemoryBinding extends SwitchboardBinding {
     await listener.node.adopt(
       remote,
       policy: listener.policy,
-      remote: 'memory binding peer',
+      remote: 'in-process peer',
     );
     dialled.add(local);
     return local;
